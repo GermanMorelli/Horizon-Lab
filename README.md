@@ -71,6 +71,9 @@ Está pensado para poder tocarlo sin saber relatividad, y para que quien sepa pu
 
 ---
 
+<img width="2560" height="1270" alt="image" src="https://github.com/user-attachments/assets/4d794799-7e22-489c-ac46-e1eab6fe2640" />
+
+
 ## Qué estás viendo
 
 Cuando abres el simulador aparece esto:
