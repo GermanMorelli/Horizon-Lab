@@ -1,0 +1,22 @@
+{
+  "name": "agujero-negro",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Simulador de agujeros negros Kerr-Newman por trazado de geodesicas nulas en GPU",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.2",
+    "playwright": "^1.62.1",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.7",
+    "vitest": "^3.2.7"
+  }
+}

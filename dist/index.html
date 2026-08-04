@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>Agujero negro Kerr-Newman — simulación por geodésicas</title>
+    <meta
+      name="description"
+      content="Simulación de agujeros negros de Kerr-Newman por trazado de geodésicas nulas en GPU. Masa, carga eléctrica y momento angular ajustables."
+    />
+    <script type="module" crossorigin src="./assets/index-Q9T_uaZn.js"></script>
+    <link rel="stylesheet" crossorigin href="./assets/index-BHa6fQBo.css">
+  </head>
+  <body>
+    <canvas id="view"></canvas>
+
+    <!-- Aviso de contexto no soportado / degradado -->
+    <div id="notice" class="notice" hidden></div>
+
+    <!-- Panel de control (poblado desde ControlPanel.ts) -->
+    <aside id="panel" class="panel">
+      <header class="panel-head">
+        <h1>Kerr&#8209;Newman</h1>
+        <button id="panel-toggle" class="icon-btn" title="Ocultar panel (H)" aria-label="Ocultar panel">‹</button>
+      </header>
+      <div id="panel-body" class="panel-body"></div>
+    </aside>
+
+    <!-- HUD de lecturas en vivo (poblado desde Hud.ts) -->
+    <section id="hud" class="hud">
+      <header class="hud-head">
+        <h2>Observables</h2>
+        <span class="hud-units">unidades de <em>M</em> (G = c = 1)</span>
+      </header>
+      <div id="hud-body" class="hud-body"></div>
+    </section>
+
+    <!-- Banner de advertencia física (singularidad desnuda, precisión, etc.) -->
+    <div id="warnings" class="warnings"></div>
+
+    <!-- Estado de render: fps, muestras acumuladas, resolución interna -->
+    <div id="stats" class="stats"></div>
+
+  </body>
+</html>
