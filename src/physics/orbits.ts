@@ -112,6 +112,21 @@ const DIFF_STEP = 1e-3
  */
 export const ORBIT_TOL_FLOOR = 1e-10
 
+/**
+ * Margen relativo sobre r_+ al que se declara la captura.
+ *
+ * No se persigue el horizonte exacto por dos razones que se refuerzan: en
+ * Boyer-Lindquist dt/dtau diverge ahi (singularidad de coordenadas), y las
+ * derivadas de H, que aqui son numericas, se vuelven enormes. El controlador de
+ * paso lo interpreta como error creciente, encoge h y la integracion se estanca sin
+ * llegar nunca a cruzar el umbral: se observaba una caida libre que agotaba 200.000
+ * pasos y terminaba como 'complete' en vez de 'captured'.
+ *
+ * Un 1 % sobre r_+ (r = 2.02 en Schwarzschild) es visualmente indistinguible del
+ * horizonte y deja las derivadas en un rango manejable.
+ */
+export const CAPTURE_MARGIN = 0.01
+
 /** Derivada de H respecto de una coordenada, por diferencias centradas de 5 puntos. */
 function dH(
   y: ParticleState,
@@ -243,7 +258,7 @@ export interface OrbitOptions {
   maxSteps?: number
   /** Parametro afin (tiempo propio) total a integrar. */
   tauMax?: number
-  /** Radio de captura; por defecto r_+ (1 + 1e-3). */
+  /** Radio de captura; por defecto r_+ (1 + CAPTURE_MARGIN). */
   rCapture?: number
   /** Radio a partir del cual se considera escapada. */
   rEscape?: number
@@ -255,6 +270,17 @@ export interface OrbitResult {
   outcome: 'captured' | 'escaped' | 'complete' | 'maxSteps'
   /** Trayectoria en coordenadas de Boyer-Lindquist. */
   path: ParticleState[]
+  /**
+   * Tiempo PROPIO acumulado en cada punto del camino (el parametro afin, que para
+   * una particula masiva con la normalizacion H = -1/2 es el tiempo propio).
+   *
+   * Se guarda aparte porque el tiempo COORDENADO ya viaja en path[i][0], y tener
+   * los dos permite animar con cualquiera de los dos relojes. La diferencia no es
+   * un detalle: en tiempo coordenado un cuerpo que cae parece frenarse y nunca
+   * llega a cruzar el horizonte, mientras que en su propio reloj lo cruza en un
+   * tiempo finito y perfectamente corriente.
+   */
+  properTime: number[]
   /** Trayectoria en pseudo-cartesianas (x, y, z), z = eje de espin. */
   cartesian: Array<[number, number, number]>
   steps: number
@@ -280,7 +306,7 @@ export function traceOrbit(
   const stride = opts.stride ?? 1
   const disc = 1 - p.a * p.a - p.q * p.q
   const rPlus = disc >= 0 ? 1 + Math.sqrt(disc) : 0
-  const rCapture = opts.rCapture ?? (rPlus > 0 ? rPlus * (1 + 1e-3) : 1e-3)
+  const rCapture = opts.rCapture ?? (rPlus > 0 ? rPlus * (1 + CAPTURE_MARGIN) : 1e-3)
   const rEscape = opts.rEscape ?? 1e4
 
   const f = (s: ParticleState) => particleRHS(s, k, p)
@@ -296,6 +322,7 @@ export function traceOrbit(
   let rMax = y[1]
 
   const path: ParticleState[] = [[...y] as ParticleState]
+  const properTime: number[] = [0]
 
   while (steps < maxSteps && tau < tauMax) {
     const hCap = Math.max(1e-9, 0.2 * (y[1] - rCapture))
@@ -315,7 +342,10 @@ export function traceOrbit(
     rMax = Math.max(rMax, y[1])
     maxDrift = Math.max(maxDrift, Math.abs(particleHamiltonian(y, k, p) - H0))
 
-    if (steps % stride === 0) path.push([...y] as ParticleState)
+    if (steps % stride === 0) {
+      path.push([...y] as ParticleState)
+      properTime.push(tau)
+    }
 
     if (y[1] <= rCapture) {
       outcome = 'captured'
@@ -331,9 +361,20 @@ export function traceOrbit(
 
   if (outcome === 'maxSteps' && tau >= tauMax) outcome = 'complete'
 
+  // El ultimo estado se registra para que el camino llegue al final real (captura o
+  // escape) y no al ultimo multiplo del stride. Se compara el TIEMPO y no la
+  // identidad del array: se empujan copias, asi que comparar referencias nunca
+  // detectaria el duplicado y el camino acabaria con dos muestras del mismo
+  // instante, lo que rompe la monotonia que exige la interpolacion.
+  if (properTime.length === 0 || tau > properTime[properTime.length - 1]) {
+    path.push([...y] as ParticleState)
+    properTime.push(tau)
+  }
+
   return {
     outcome,
     path,
+    properTime,
     cartesian: path.map(toCartesian),
     steps,
     tau,
@@ -359,6 +400,122 @@ export function toCartesian(y: ParticleState): [number, number, number] {
   const th = y[2]
   const ph = y[3]
   return [r * Math.sin(th) * Math.cos(ph), r * Math.sin(th) * Math.sin(ph), r * Math.cos(th)]
+}
+
+// ---------------------------------------------------------------------------
+// Animacion a lo largo de la trayectoria
+// ---------------------------------------------------------------------------
+
+/** Con que reloj se recorre la trayectoria. */
+export type Clock = 'proper' | 'coordinate'
+
+export interface Snapshot {
+  /** Posicion en Boyer-Lindquist. */
+  x: [number, number, number]
+  /** Posicion en pseudo-cartesianas para dibujar. */
+  cart: [number, number, number]
+  /** Tiempo propio y coordenado en este instante. */
+  tau: number
+  t: number
+  /** Radio actual. */
+  r: number
+  /** Fraccion recorrida del camino, en [0, 1]. */
+  progress: number
+  /** true si se ha alcanzado el final del camino. */
+  ended: boolean
+}
+
+/**
+ * Duracion total del recorrido en el reloj elegido.
+ *
+ * Los dos relojes divergen brutalmente cerca del horizonte: para una caida, el
+ * tiempo propio total es finito y modesto, mientras que el coordenado diverge. De
+ * ahi que la animacion necesite saber en que reloj se le esta pidiendo avanzar.
+ */
+export function pathDuration(res: OrbitResult, clock: Clock): number {
+  const n = res.path.length
+  if (n < 2) return 0
+  return clock === 'proper'
+    ? res.properTime[n - 1] - res.properTime[0]
+    : res.path[n - 1][0] - res.path[0][0]
+}
+
+/**
+ * Estado del cuerpo en el instante `time` del reloj elegido, interpolando
+ * linealmente entre los puntos registrados del camino.
+ *
+ * La interpolacion es lineal a proposito: el camino se muestrea con paso adaptativo
+ * fino, asi que entre dos muestras consecutivas la trayectoria es practicamente
+ * recta, y una interpolacion de orden superior no aportaria nada visible mientras
+ * complicaria el manejo del cruce del eje.
+ */
+export function sampleAt(res: OrbitResult, time: number, clock: Clock): Snapshot | null {
+  const n = res.path.length
+  if (n === 0) return null
+  const key = (i: number) => (clock === 'proper' ? res.properTime[i] : res.path[i][0])
+
+  const t0 = key(0)
+  const tEnd = key(n - 1)
+  const total = tEnd - t0
+  const clamped = Math.min(Math.max(time, 0), Math.max(total, 0))
+  const target = t0 + clamped
+
+  // Busqueda binaria del intervalo: el camino puede tener decenas de miles de
+  // puntos y esto se llama en cada frame.
+  let lo = 0
+  let hi = n - 1
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1
+    if (key(mid) <= target) lo = mid
+    else hi = mid
+  }
+
+  const kA = key(lo)
+  const kB = key(hi)
+  const f = kB > kA ? (target - kA) / (kB - kA) : 0
+  const a = res.path[lo]
+  const b = res.path[hi]
+
+  // El azimut puede dar muchas vueltas; interpolarlo directamente es correcto
+  // porque no se envuelve en el estado.
+  const x: [number, number, number] = [
+    a[1] + (b[1] - a[1]) * f,
+    a[2] + (b[2] - a[2]) * f,
+    a[3] + (b[3] - a[3]) * f,
+  ]
+  const st = Math.sin(x[1])
+  return {
+    x,
+    cart: [x[0] * st * Math.cos(x[2]), x[0] * st * Math.sin(x[2]), x[0] * Math.cos(x[1])],
+    tau: res.properTime[lo] + (res.properTime[hi] - res.properTime[lo]) * f,
+    t: a[0] + (b[0] - a[0]) * f,
+    r: x[0],
+    progress: total > 0 ? clamped / total : 1,
+    ended: clamped >= total,
+  }
+}
+
+/**
+ * Radio minimo alcanzado y en que instante de cada reloj, para poder anunciar
+ * cuando el cuerpo llega al periastro o al radio de marea.
+ */
+export function findFirstCrossing(
+  res: OrbitResult,
+  radius: number,
+  clock: Clock,
+): { time: number; index: number } | null {
+  for (let i = 1; i < res.path.length; i++) {
+    const rA = res.path[i - 1][1]
+    const rB = res.path[i][1]
+    if (rA > radius && rB <= radius) {
+      const f = (rA - radius) / (rA - rB)
+      const kA = clock === 'proper' ? res.properTime[i - 1] : res.path[i - 1][0]
+      const kB = clock === 'proper' ? res.properTime[i] : res.path[i][0]
+      const t0 = clock === 'proper' ? res.properTime[0] : res.path[0][0]
+      return { time: kA + (kB - kA) * f - t0, index: i }
+    }
+  }
+  return null
 }
 
 // ---------------------------------------------------------------------------

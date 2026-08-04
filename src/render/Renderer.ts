@@ -18,6 +18,8 @@ import {
   relativeVisibleRadiance,
 } from '../physics/blackbody'
 import type { Derived, SimParams } from '../state/params'
+import { ALPHA_CAPTURE } from '../physics/binary'
+import { MeshView } from './MeshView'
 import { OrbitOverlay } from './OrbitOverlay'
 import {
   createDummyCubemap,
@@ -31,8 +33,11 @@ import {
   type RenderTarget,
 } from './gl'
 
+import { bodyPositions, stepOrbit, type BinaryOrbit } from '../physics/pn'
+
 import quadVert from './shaders/quad.vert'
 import kerrFrag from './shaders/kerr.frag'
+import binaryFrag from './shaders/binary.frag'
 import compositeFrag from './shaders/composite.frag'
 import bloomFrag from './shaders/bloom.frag'
 
@@ -54,8 +59,36 @@ export class Renderer {
   readonly degraded: boolean
 
   private progTrace: Program
+  private progBinary: Program
   private progComposite: Program
   private progBloom: Program
+
+  /**
+   * Estado orbital vivo de la binaria. Lo avanza `advanceTime` con la dinamica
+   * post-newtoniana; NO sale de las ecuaciones de Einstein (ver binary.ts).
+   */
+  private orbit: BinaryOrbit = { m1: 0.55, m2: 0.45, a: 40, e: 0, nu: 0 }
+  private merged = false
+
+  get binaryOrbit(): Readonly<BinaryOrbit> {
+    return this.orbit
+  }
+
+  get binaryMerged(): boolean {
+    return this.merged
+  }
+
+  /** Reinicia la orbita a los parametros del panel. */
+  resetOrbit(p: SimParams, d: Derived): void {
+    this.orbit = {
+      m1: d.binaryM1,
+      m2: d.binaryM2,
+      a: p.binarySeparation,
+      e: p.binaryEccentricity,
+      nu: 0,
+    }
+    this.merged = false
+  }
 
   private accum: [RenderTarget, RenderTarget] | null = null
   /** Objetivo que contiene la acumulacion mas reciente. */
@@ -150,6 +183,7 @@ export class Renderer {
       false,
     )
 
+    this.progBinary = new Program(gl, quadVert, binaryFrag, 'trazador binaria Brill-Lindquist')
     this.progTrace = new Program(gl, quadVert, kerrFrag, 'trazador Kerr-Newman')
     this.progComposite = new Program(gl, quadVert, compositeFrag, 'composite')
     this.progBloom = new Program(gl, quadVert, bloomFrag, 'bloom')
@@ -158,10 +192,13 @@ export class Renderer {
     this.dummyCube = createDummyCubemap(gl)
     this.vao = gl.createVertexArray()!
     this.overlay = new OrbitOverlay(gl)
+    this.mesh = new MeshView(gl)
   }
 
   /** Overlay esquematico de orbitas de prueba. */
   readonly overlay: OrbitOverlay
+  /** Vista de la malla del espaciotiempo (modo 'mesh'). */
+  readonly mesh: MeshView
 
   /** Reinicia la acumulacion: la imagen actual ya no es valida. */
   invalidate(): void {
@@ -210,6 +247,38 @@ export class Renderer {
     gl.disable(gl.BLEND)
     gl.disable(gl.DEPTH_TEST)
 
+    // --- Modo malla: es un diagrama, no un trazado de luz ------------------
+    // Se salta el raytracer por completo (seria absurdo pagarlo) y se dibuja la
+    // superficie del embedding directamente al canvas.
+    if (p.mode === 'mesh') {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+      gl.viewport(0, 0, this.canvas.width, this.canvas.height)
+      gl.clearColor(0.016, 0.02, 0.035, 1)
+      gl.clear(gl.COLOR_BUFFER_BIT)
+      gl.bindVertexArray(null)
+      this.mesh.draw(
+        {
+          distance: d.camDistanceRg,
+          inclination: p.inclination,
+          azimuth: p.azimuth,
+          tanHalfFov: Math.tan(p.fov / 2),
+          aspect: this.canvas.width / Math.max(this.canvas.height, 1),
+        },
+        d.bh,
+        p,
+      )
+      this.tracedFrames++
+      return {
+        samples: 1,
+        targetSamples: 1,
+        internalWidth: this.canvas.width,
+        internalHeight: this.canvas.height,
+        scale: 1,
+        frameMs: this.frameMsAvg,
+        converged: true,
+      }
+    }
+
     // --- Pase de trazado -> acumulador -------------------------------------
     // Se omite cuando la imagen ya convergio. El composite, en cambio, se
     // ejecuta SIEMPRE: con preserveDrawingBuffer:false el contenido del canvas
@@ -225,13 +294,15 @@ export class Renderer {
       gl.bindFramebuffer(gl.FRAMEBUFFER, dst.fbo)
       gl.viewport(0, 0, this.internalW, this.internalH)
 
-      this.progTrace.use()
-      this.setTraceUniforms(p, d, realtime)
-      this.progTrace.tex('u_prevAccum', 0, gl.TEXTURE_2D, src.tex)
-      this.progTrace.tex('u_bbLUT', 1, gl.TEXTURE_2D, this.lut)
+      const prog = p.mode === 'binary' ? this.progBinary : this.progTrace
+      prog.use()
+      if (p.mode === 'binary') this.setBinaryUniforms(p, d, realtime)
+      else this.setTraceUniforms(p, d, realtime)
+      prog.tex('u_prevAccum', 0, gl.TEXTURE_2D, src.tex)
+      prog.tex('u_bbLUT', 1, gl.TEXTURE_2D, this.lut)
       // El samplerCube necesita su propia unidad aunque no se use (ver gl.ts).
-      this.progTrace.tex('u_starCube', 2, gl.TEXTURE_CUBE_MAP, this.dummyCube)
-      this.progTrace.f('u_sampleIndex', this.sampleIndex)
+      prog.tex('u_starCube', 2, gl.TEXTURE_CUBE_MAP, this.dummyCube)
+      prog.f('u_sampleIndex', this.sampleIndex)
       gl.drawArrays(gl.TRIANGLES, 0, 3)
 
       this.sampleIndex++
@@ -271,7 +342,9 @@ export class Renderer {
     gl.bindVertexArray(null)
 
     // --- Overlay esquematico de orbitas (encima del tonemap) ---------------
-    if (this.overlay && !this.overlay.isEmpty && p.showOrbits) {
+    // El overlay de orbitas usa coordenadas de Boyer-Lindquist, asi que solo
+    // aplica al modo de un solo agujero.
+    if (p.mode === 'single' && this.overlay && !this.overlay.isEmpty && p.showOrbits) {
       this.overlay.draw(
         {
           r: d.camDistanceRg,
@@ -282,6 +355,7 @@ export class Renderer {
         },
         d.bh,
         p.orbitOpacity,
+        p.bodyClock,
       )
     }
 
@@ -362,6 +436,163 @@ export class Renderer {
     return b0.tex
   }
 
+  /**
+   * Uniforms del trazador de la binaria.
+   *
+   * A diferencia del modo de un solo agujero, aqui la camara necesita una base 3D
+   * completa: sin simetria axial no hay direccion privilegiada que permita
+   * construir el rayo a partir de (r, theta, phi) como en Boyer-Lindquist.
+   */
+  private setBinaryUniforms(p: SimParams, d: Derived, realtime: boolean): void {
+    const t = this.progBinary
+    const aspect = this.internalW / Math.max(this.internalH, 1)
+
+    // Posiciones de las punturas desde la orbita viva.
+    const { p1, p2 } = bodyPositions(this.orbit)
+    t.v3('u_bh1Pos', p1[0], p1[1], p1[2])
+    t.v3('u_bh2Pos', p2[0], p2[1], p2[2])
+    t.f('u_bh1Mass', this.orbit.m1)
+    t.f('u_bh2Mass', this.orbit.m2)
+
+    // Camara orbitando el centro de masas.
+    const D = d.camDistanceRg
+    const si = Math.sin(p.inclination)
+    const ci = Math.cos(p.inclination)
+    const sa = Math.sin(p.azimuth)
+    const ca = Math.cos(p.azimuth)
+    const cam: [number, number, number] = [D * si * ca, D * si * sa, D * ci]
+    const fwd: [number, number, number] = [-si * ca, -si * sa, -ci]
+    // El eje z (el eje orbital) hace de vertical del mundo.
+    let rx = -sa
+    let ry = ca
+    let rz = 0
+    const rn = Math.hypot(rx, ry, rz) || 1
+    rx /= rn
+    ry /= rn
+    rz /= rn
+    // up = right x fwd, para que la base quede derecha.
+    const ux = ry * fwd[2] - rz * fwd[1]
+    const uy = rz * fwd[0] - rx * fwd[2]
+    const uz = rx * fwd[1] - ry * fwd[0]
+
+    t.v3('u_camPos', cam[0], cam[1], cam[2])
+    t.v3('u_camFwd', fwd[0], fwd[1], fwd[2])
+    t.v3('u_camRight', rx, ry, rz)
+    t.v3('u_camUp', ux, uy, uz)
+    t.f('u_tanHalfFov', Math.tan(p.fov / 2))
+    t.f('u_aspect', aspect)
+    t.v2('u_resolution', this.internalW, this.internalH)
+
+    if (realtime || this.sampleIndex === 0) {
+      t.v2('u_jitter', 0, 0)
+    } else {
+      const i = this.sampleIndex + 1
+      t.v2('u_jitter', halton(i, 2) - 0.5, halton(i, 3) - 0.5)
+    }
+
+    t.i('u_maxIter', realtime ? Math.round(p.maxIter * 0.55) : p.maxIter)
+    t.f('u_tol', realtime ? p.tolerance * 20 : p.tolerance)
+    t.f('u_rEscape', p.rEscape)
+    t.f('u_alphaCapture', ALPHA_CAPTURE)
+    t.f('u_hInit', Math.max(0.05, D * 0.02))
+    t.b('u_markNonConverged', p.markNonConverged)
+    t.b('u_showHorizonGrid', p.binaryShowGrid)
+    t.f('u_layerOpacity', p.layerOpacity)
+
+    // Fondo estelar: en este modo es la unica fuente de luz, asi que el lente
+    // doble se lee sobre el.
+    t.b('u_starsEnabled', true)
+    t.f('u_starIntensity', p.starIntensity)
+    t.f('u_starDensity', p.starDensity)
+    t.f('u_milkyWayIntensity', p.milkyWayIntensity)
+    t.b('u_useStarCube', false)
+    t.f('u_lutLogTMin', LUT_LOG_T_MIN)
+    t.f('u_lutLogTMax', LUT_LOG_T_MAX)
+    this.setGalaxyUniforms(t, p)
+  }
+
+  /**
+   * Galaxias de fondo. Van de fondo y no en orbita, a proposito: una galaxia es
+   * mucho mas masiva y grande que cualquier agujero negro. Lo que se traza es su
+   * LENTE gravitacional, que es lo que se observa de verdad.
+   *
+   * Las direcciones se reparten por el cielo con un hash fijo (reproducible), salvo
+   * la primera, que opcionalmente se alinea justo detras del agujero para producir
+   * un anillo de Einstein completo.
+   */
+  private setGalaxyUniforms(prog: Program, p: SimParams): void {
+    const n = Math.max(0, Math.min(4, Math.round(p.galaxyCount)))
+    prog.i('u_galaxyCount', n)
+    prog.f('u_galaxySpiral', p.galaxySpiral)
+    if (n === 0) return
+
+    // Direccion desde el agujero hacia el lado opuesto a la camara: los rayos que
+    // rozan el agujero salen por ahi, asi que una galaxia colocada en esa direccion
+    // se ve como un anillo alrededor de la sombra.
+    const si = Math.sin(p.inclination)
+    const ci = Math.cos(p.inclination)
+    const sa = Math.sin(p.azimuth)
+    const ca = Math.cos(p.azimuth)
+    const behind: [number, number, number] = [-si * ca, -si * sa, -ci]
+
+    // Base ortonormal alrededor de la direccion "detras del agujero", para colocar
+    // las galaxias como desplazamientos angulares respecto a ella.
+    //
+    // Se reparten ALREDEDOR de esa direccion y no por posiciones fijas del cielo a
+    // proposito: con direcciones arbitrarias caen fuera del campo de vision y no se
+    // ven en absoluto (se midio que una galaxia sin alinear no aportaba nada de luz
+    // a la escena, lo que hacia la funcion inutil).
+    const helper: [number, number, number] =
+      Math.abs(behind[2]) < 0.9 ? [0, 0, 1] : [1, 0, 0]
+    const t1 = normalize3(cross3(helper, behind))
+    const t2 = cross3(behind, t1)
+
+    /** Desplazamientos angulares (radianes) respecto a la direccion trasera. */
+    const offsets: Array<[number, number]> = [
+      [0, 0],
+      [0.26, 0.13],
+      [-0.19, 0.31],
+      [0.34, -0.29],
+    ]
+
+    for (let i = 0; i < n; i++) {
+      let [ou, ov] = offsets[i]
+      // Sin alinear, tambien la primera se desplaza: asi el interruptor tiene un
+      // efecto visible (alineada da anillo completo; desplazada, un arco).
+      if (i === 0 && !p.galaxyAlignBehind) {
+        ou = 0.22
+        ov = -0.16
+      }
+      const dir = normalize3([
+        behind[0] + t1[0] * ou + t2[0] * ov,
+        behind[1] + t1[1] * ou + t2[1] * ov,
+        behind[2] + t1[2] * ou + t2[2] * ov,
+      ])
+      prog.v3(`u_galaxyDir[${i}]`, dir[0], dir[1], dir[2])
+      // Tamano, achatamiento, angulo de posicion y brillo, variados por indice para
+      // que no parezcan copias.
+      const sizeMul = [1, 0.65, 0.85, 0.5][i]
+      const axis = [0.42, 0.8, 0.3, 0.62][i]
+      const pa = [0.4, 1.9, 2.7, 0.9][i]
+      const bright = [1, 0.55, 0.7, 0.4][i]
+      prog.v4(
+        `u_galaxyShape[${i}]`,
+        p.galaxySize * sizeMul,
+        axis,
+        pa,
+        p.galaxyBrightness * bright,
+      )
+      // Colores tipicos: espirales azuladas, elipticas amarillentas.
+      const col: Array<[number, number, number]> = [
+        [0.72, 0.82, 1.0],
+        [1.0, 0.86, 0.62],
+        [0.85, 0.9, 1.0],
+        [1.0, 0.78, 0.55],
+      ]
+      prog.v3(`u_galaxyColor[${i}]`, col[i][0], col[i][1], col[i][2])
+    }
+  }
+
   private setTraceUniforms(p: SimParams, d: Derived, realtime: boolean): void {
     const t = this.progTrace
     const aspect = this.internalW / Math.max(this.internalH, 1)
@@ -413,6 +644,7 @@ export class Renderer {
     t.f('u_starDensity', p.starDensity)
     t.f('u_milkyWayIntensity', p.milkyWayIntensity)
     t.b('u_useStarCube', false)
+    this.setGalaxyUniforms(t, p)
 
     // Capas
     t.b('u_showHorizon', p.showHorizon)
@@ -438,6 +670,18 @@ export class Renderer {
    * abarca de milisegundos a dias); la correspondencia real la reporta el HUD.
    */
   advanceTime(dtSeconds: number, p: SimParams, d: Derived): boolean {
+    // --- Binaria: la orbita la avanza la dinamica post-newtoniana ------------
+    if (p.mode === 'binary') {
+      if (!p.binaryEvolving || this.merged) return false
+      // El paso de tiempo geometrico se escala para que el inspiral sea visible:
+      // el tiempo fisico de coalescencia va como a^4 y abarca de segundos a eones.
+      const scale = 0.02 * Math.pow(this.orbit.a, 4) / (this.orbit.m1 * this.orbit.m2)
+      const r = stepOrbit(this.orbit, dtSeconds * scale * p.binaryTimeScale)
+      this.orbit = r.orbit
+      this.merged = r.merged
+      return true
+    }
+
     if (!p.diskEnabled || p.timeWarp <= 0) return false
     const omegaIsco = 1 / (Math.pow(d.rDiskInner, 1.5) + (p.diskPrograde ? p.spin : -p.spin))
     // Una vuelta completa del ISCO en ~12 s reales a timeWarp = 1.
@@ -527,8 +771,24 @@ export class Renderer {
     gl.deleteTexture(this.dummyCube)
     gl.deleteVertexArray(this.vao)
     this.progTrace.dispose()
+    this.progBinary.dispose()
     this.progComposite.dispose()
     this.progBloom.dispose()
     this.overlay.dispose()
+    this.mesh.dispose()
   }
+}
+
+// --- Algebra vectorial minima, para colocar las galaxias de fondo -----------
+
+function cross3(
+  a: readonly [number, number, number],
+  b: readonly [number, number, number],
+): [number, number, number] {
+  return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+}
+
+function normalize3(a: readonly [number, number, number]): [number, number, number] {
+  const n = Math.hypot(a[0], a[1], a[2]) || 1
+  return [a[0] / n, a[1] / n, a[2] / n]
 }

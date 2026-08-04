@@ -18,6 +18,17 @@ export const SIGMA_SB = 5.670374419e-8 // W m^-2 K^-4
 export const M_SUN = 1.98892e30 // kg
 export const L_SUN = 3.828e26 // W
 
+/**
+ * Parametro gravitacional solar nominal de la IAU, en m^3/s^2.
+ *
+ * Se usa este producto y no G * M_SUN a proposito: GM_sol se conoce con nueve
+ * cifras significativas por dinamica del sistema solar, mientras que G y M_sol por
+ * separado solo tienen cuatro o cinco. Multiplicarlos por separado desplaza la
+ * cuarta cifra y hace que GM/c^3 salga 4.9268 us en vez de los 4.92549 us
+ * tabulados.
+ */
+export const GM_SUN = 1.32712440018e20
+
 /** Longitudes de referencia (m). */
 export const AU = 1.495978707e11
 export const PARSEC = 3.0856775814913673e16
@@ -28,7 +39,7 @@ export const LIGHT_YEAR = C * 365.25 * 86400
  * Para 1 M_sol vale 1476.6 m. Es la unidad de longitud del motor (M = 1).
  */
 export function gravitationalRadius(massSolar: number): number {
-  return (G * massSolar * M_SUN) / (C * C)
+  return (GM_SUN * massSolar) / (C * C)
 }
 
 /** r_g para 1 masa solar, en metros. Util para comprobaciones rapidas. */

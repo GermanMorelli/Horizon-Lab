@@ -13,6 +13,7 @@ precision highp sampler2D;
 // ---------------------------------------------------------------------------
 
 #include "metric.glsl"
+#include "blackbody.glsl"
 #include "disk.glsl"
 #include "starfield.glsl"
 #include "layers.glsl"

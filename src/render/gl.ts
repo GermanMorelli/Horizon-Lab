@@ -111,6 +111,10 @@ export class Program {
     const l = this.loc(name)
     if (l) this.gl.uniform3f(l, x, y, z)
   }
+  v4(name: string, x: number, y: number, z: number, w: number): void {
+    const l = this.loc(name)
+    if (l) this.gl.uniform4f(l, x, y, z, w)
+  }
   /** Enlaza una textura a una unidad y fija el sampler uniforme. */
   tex(name: string, unit: number, target: number, tex: WebGLTexture | null): void {
     const gl = this.gl

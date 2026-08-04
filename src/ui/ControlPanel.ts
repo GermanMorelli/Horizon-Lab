@@ -4,7 +4,14 @@
  */
 
 import { formatLength, formatMass, PARSEC } from '../physics/units'
-import { SPIN_LIMIT, type DistanceMode, type ParamStore, type SimParams } from '../state/params'
+import {
+  SPIN_LIMIT,
+  type DistanceMode,
+  type ParamStore,
+  type SimParams,
+  type ViewMode,
+} from '../state/params'
+import { BODY_CATALOG } from '../physics/bodies'
 import { PRESETS, type Preset } from './Presets'
 import {
   button,
@@ -30,6 +37,14 @@ export interface ControlPanelOptions {
   /** Lanza una particula de prueba con los parametros actuales. */
   onLaunchOrbit: () => void
   onClearOrbits: () => void
+  /** Reinicia el reloj de todos los cuerpos animados. */
+  onRewindBodies: () => void
+  /** Cambia de modo. Quien lo implementa reencuadra tambien la camara. */
+  onModeChange: (m: ViewMode) => void
+  /** Reinicia la orbita de la binaria a los parametros actuales. */
+  onResetOrbit: () => void
+  /** Carga las masas y la distancia de GW150914. */
+  onGW150914: () => void
 }
 
 export class ControlPanel {
@@ -38,6 +53,9 @@ export class ControlPanel {
   private distMode!: SegmentedHandle<DistanceMode>
   private diskDir!: SegmentedHandle<'pro' | 'retro'>
   private orbitDir!: SegmentedHandle<'pro' | 'retro'>
+  private modeSeg!: SegmentedHandle<ViewMode>
+  private bodyClockSeg!: SegmentedHandle<'proper' | 'coordinate'>
+  private bodyKindSel!: HTMLSelectElement
   private distSlider!: SliderHandle
   private syncing = false
 
@@ -60,12 +78,15 @@ export class ControlPanel {
 
   private build(): void {
     this.root.append(
+      this.buildMode(),
       this.buildPresets(),
+      this.buildBinary(),
       this.buildBlackHole(),
       this.buildCamera(),
       this.buildDisk(),
       this.buildBackground(),
       this.buildLayers(),
+      this.buildMesh(),
       this.buildOrbits(),
       this.buildRender(),
     )
@@ -73,8 +94,95 @@ export class ControlPanel {
 
   // -------------------------------------------------------------------------
 
+  private buildMesh(): HTMLElement {
+    const s = section('Malla del espaciotiempo', true)
+    s.root.dataset.onlyMode = 'mesh'
+
+    const surf = toggle('Superficie del embedding', this.p.meshShowSurface, (v) =>
+      this.patch({ meshShowSurface: v }),
+    )
+    this.toggles.set('meshShowSurface', surf)
+
+    const lapseT = toggle('Colorear por dilatación temporal', this.p.meshShowLapse, (v) =>
+      this.patch({ meshShowLapse: v }),
+    )
+    lapseT.root.title =
+      'El color es el lapso α = dτ/dt. Es la parte que la cama elástica omite, y la que ' +
+      'de verdad explica por qué cae un objeto lento.'
+    this.toggles.set('meshShowLapse', lapseT)
+
+    const horizonT = toggle('Superficie del horizonte', this.p.meshShowHorizon, (v) =>
+      this.patch({ meshShowHorizon: v }),
+    )
+    horizonT.root.title =
+      'Con a/M > √3/2 ≈ 0.866 el horizonte no cabe en espacio euclídeo (Smarr 1973) y se ' +
+      'marca en rojo.'
+    this.toggles.set('meshShowHorizon', horizonT)
+
+    const outer = slider({
+      label: 'Radio exterior',
+      symbol: 'r',
+      min: 5,
+      max: 60,
+      step: 0.5,
+      value: this.p.meshOuterRadius,
+      format: (v) => `${v.toFixed(1)} M`,
+      onInput: (v) => this.patch({ meshOuterRadius: v }),
+    })
+    this.sliders.set('meshOuterRadius', outer)
+
+    const height = slider({
+      label: 'Exageración vertical',
+      min: 0.2,
+      max: 3,
+      step: 0.05,
+      value: this.p.meshHeightScale,
+      format: (v) => (Math.abs(v - 1) < 0.03 ? '1.00× (isométrico)' : `${v.toFixed(2)}×`),
+      onInput: (v) => this.patch({ meshHeightScale: v }),
+    })
+    this.sliders.set('meshHeightScale', height)
+
+    const density = slider({
+      label: 'Densidad de la rejilla',
+      min: 0.3,
+      max: 2.5,
+      step: 0.05,
+      value: this.p.meshGridDensity,
+      format: (v) => `${v.toFixed(2)}×`,
+      onInput: (v) => this.patch({ meshGridDensity: v }),
+    })
+    this.sliders.set('meshGridDensity', density)
+
+    s.body.append(
+      note(
+        'La superficie es el <b>embedding isométrico exacto</b> de la rebanada ecuatorial: ' +
+          '<code>z(r) = √(8M(r−2M))</code> para Schwarzschild, que reproduce la métrica ' +
+          'inducida <code>dr²/(1−2M/r)</code> sin aproximar. Las distancias medidas sobre ella ' +
+          'son distancias propias reales.',
+      ),
+      surf.root,
+      lapseT.root,
+      horizonT.root,
+      outer.root,
+      height.root,
+      density.root,
+      note(
+        '<b>Cuidado con la cama elástica.</b> Esto es <em>una rebanada espacial</em>, no el ' +
+          'espaciotiempo; la altura es una dimensión auxiliar que no existe físicamente, y nada ' +
+          'cae "hacia abajo" por ella. Y sobre todo: la curvatura del espacio <b>no</b> es lo ' +
+          'que hace caer a los objetos — para velocidades bajas casi toda la gravedad newtoniana ' +
+          'sale de la curvatura del <b>tiempo</b>. Por eso el color importa más que la forma: es ' +
+          'el gradiente del lapso el que produce la caída.',
+      ),
+    )
+    return s.root
+  }
+
+  // -------------------------------------------------------------------------
+
   private buildOrbits(): HTMLElement {
     const s = section('Órbitas de prueba', false)
+    s.root.dataset.onlyMode = 'single'
 
     const show = toggle('Mostrar órbitas', this.p.showOrbits, (v) =>
       this.patch({ showOrbits: v }),
@@ -160,10 +268,57 @@ export class ControlPanel {
     )
     this.orbitDir = dir
 
+    // --- Cuerpo que se coloca ---------------------------------------------
+    const kindRow = el('div', 'ctl')
+    const kindLabel = el('div', 'ctl-label')
+    kindLabel.append(el('span', 'name', 'Cuerpo'))
+    const kindSel = el('select')
+    kindSel.className = 'select'
+    for (const [key, spec] of Object.entries(BODY_CATALOG)) {
+      const o = document.createElement('option')
+      o.value = key
+      o.textContent = spec.label
+      if (key === this.p.bodyKind) o.selected = true
+      kindSel.appendChild(o)
+    }
+    kindSel.addEventListener('change', () => this.patch({ bodyKind: kindSel.value }))
+    this.bodyKindSel = kindSel
+    kindRow.append(kindLabel, kindSel)
+
+    const clock = segmented<'proper' | 'coordinate'>(
+      [
+        { value: 'proper', label: 'reloj del cuerpo', title: 'Tiempo propio: cruza el horizonte en tiempo finito' },
+        { value: 'coordinate', label: 'reloj lejano', title: 'Tiempo coordenado: parece frenarse y no cruzar nunca' },
+      ],
+      this.p.bodyClock,
+      (v) => this.patch({ bodyClock: v }),
+    )
+    this.bodyClockSeg = clock
+
+    const playing = toggle('Animación en marcha', this.p.bodyPlaying, (v) =>
+      this.patch({ bodyPlaying: v }),
+    )
+    this.toggles.set('bodyPlaying', playing)
+
+    const loop = toggle('Repetir al terminar', this.p.bodyLoop, (v) => this.patch({ bodyLoop: v }))
+    this.toggles.set('bodyLoop', loop)
+
+    const bodySpeed = slider({
+      label: 'Velocidad de la animación',
+      min: 1,
+      max: 2000,
+      value: this.p.bodySpeed,
+      log: true,
+      format: (v) => `${v.toPrecision(3)} M/s`,
+      onInput: (v) => this.patch({ bodySpeed: v }),
+    })
+    this.sliders.set('bodySpeed', bodySpeed)
+
     const actions = el('div', 'btn-row')
     actions.append(
-      button('Lanzar partícula', () => this.opts.onLaunchOrbit()),
-      button('Borrar todas', () => this.opts.onClearOrbits()),
+      button('Colocar cuerpo', () => this.opts.onLaunchOrbit()),
+      button('Reiniciar', () => this.opts.onRewindBodies()),
+      button('Borrar todos', () => this.opts.onClearOrbits()),
     )
 
     s.body.append(
@@ -175,12 +330,28 @@ export class ControlPanel {
           'por detrás del agujero <em>debería</em> verse deformada por el lente, y aquí ' +
           'aparece recta. Sí se atenúan al pasar tras el horizonte.',
       ),
+      kindRow,
       radius.root,
       incl.root,
       speed.root,
       dir.root,
       charge.root,
       revs.root,
+      note(
+        'Un planeta o una estrella orbitando un agujero negro <b>es</b> una partícula de prueba: ' +
+          'su masa es despreciable, así que sigue exactamente una geodésica temporal del fondo. ' +
+          'Eso es relatividad general exacta, no una aproximación. La estrella <b>S2</b> alrededor ' +
+          'de Sgr A* es la comprobación observacional: GRAVITY midió su precesión en 2020.',
+      ),
+      clock.root,
+      note(
+        'Los dos relojes divergen: en <b>tiempo propio</b> el cuerpo cruza el horizonte en un ' +
+          'tiempo finito y corriente; en <b>tiempo coordenado</b> parece frenarse y no llegar ' +
+          'nunca. Ninguno es «el correcto» — son dos preguntas distintas.',
+      ),
+      playing.root,
+      loop.root,
+      bodySpeed.root,
       op.root,
       actions,
       note(
@@ -195,6 +366,132 @@ export class ControlPanel {
   }
 
   // -------------------------------------------------------------------------
+
+  private buildMode(): HTMLElement {
+    const s = section('Modo', true)
+    this.modeSeg = segmented<ViewMode>(
+      [
+        { value: 'single', label: 'Un agujero', title: 'Kerr-Newman: masa, carga y espín' },
+        { value: 'binary', label: 'Dos agujeros', title: 'Brill-Lindquist + post-newtoniano' },
+        { value: 'mesh', label: 'Malla', title: 'Geometría de la rebanada espacial' },
+      ],
+      this.p.mode,
+      // El cambio de modo pasa por el callback, no por un patch directo: main.ts
+      // reencuadra la camara al mismo tiempo (ver switchMode).
+      (v) => this.opts.onModeChange(v),
+    )
+    s.body.append(this.modeSeg.root)
+    return s.root
+  }
+
+  // -------------------------------------------------------------------------
+
+  private buildBinary(): HTMLElement {
+    const s = section('Dos agujeros negros', true)
+    s.root.dataset.onlyMode = 'binary'
+
+    const ratio = slider({
+      label: 'Reparto de masa',
+      symbol: 'm₁/M',
+      min: 0.05,
+      max: 0.95,
+      step: 0.005,
+      value: this.p.binaryMassRatio,
+      format: (v) => `${(v * 100).toFixed(1)} / ${((1 - v) * 100).toFixed(1)} %`,
+      onInput: (v) => this.patch({ binaryMassRatio: v }),
+    })
+    this.sliders.set('binaryMassRatio', ratio)
+
+    const sep = slider({
+      label: 'Separación',
+      symbol: 'a',
+      min: 8,
+      max: 200,
+      step: 0.5,
+      value: this.p.binarySeparation,
+      format: (v) => `${v.toFixed(1)} M`,
+      onInput: (v) => this.patch({ binarySeparation: v }),
+    })
+    this.sliders.set('binarySeparation', sep)
+
+    const ecc = slider({
+      label: 'Excentricidad',
+      symbol: 'e',
+      min: 0,
+      max: 0.9,
+      step: 0.005,
+      value: this.p.binaryEccentricity,
+      format: (v) => v.toFixed(3),
+      onInput: (v) => this.patch({ binaryEccentricity: v }),
+    })
+    this.sliders.set('binaryEccentricity', ecc)
+
+    const evolving = toggle('Inspiral activo', this.p.binaryEvolving, (v) =>
+      this.patch({ binaryEvolving: v }),
+    )
+    evolving.root.title =
+      'La órbita decae por emisión de ondas gravitacionales (ecuaciones de Peters). ' +
+      'Mientras evoluciona, la imagen se renderiza en tiempo real y no acumula muestras.'
+    this.toggles.set('binaryEvolving', evolving)
+
+    const speed = slider({
+      label: 'Velocidad del inspiral',
+      min: 0.05,
+      max: 20,
+      value: this.p.binaryTimeScale,
+      log: true,
+      format: (v) => `${v.toFixed(2)}×`,
+      onInput: (v) => this.patch({ binaryTimeScale: v }),
+    })
+    this.sliders.set('binaryTimeScale', speed)
+
+    const grid = toggle('Rejilla en los horizontes', this.p.binaryShowGrid, (v) =>
+      this.patch({ binaryShowGrid: v }),
+    )
+    grid.root.title = 'Colorea cada sombra según qué agujero capturó el rayo'
+    this.toggles.set('binaryShowGrid', grid)
+
+    const audio = toggle('Chirp audible', this.p.chirpAudio, (v) =>
+      this.patch({ chirpAudio: v }),
+    )
+    audio.root.title =
+      'Sonifica la frecuencia de la onda gravitacional. Para masas estelares cae ' +
+      'directamente en el rango audible: es el chirp de LIGO.'
+    this.toggles.set('chirpAudio', audio)
+
+    const row = el('div', 'btn-row')
+    row.append(
+      button('Reiniciar órbita', () => this.opts.onResetOrbit()),
+      button('GW150914', () => this.opts.onGW150914(), 'Masas y distancia de la primera detección'),
+    )
+
+    s.body.append(
+      note(
+        '<b>No existe solución exacta de Einstein para dos agujeros negros.</b> Lo que se traza ' +
+          'aquí son <b>datos iniciales de Brill-Lindquist</b>, que sí son solución exacta de las ' +
+          '<em>ligaduras</em>: <code>ψ = 1 + m₁/2r₁ + m₂/2r₂</code>, con la métrica ' +
+          '<code>ψ⁴δᵢⱼ</code> y el horizonte en <code>ψ = 2</code>. Las órbitas las da la ' +
+          'dinámica post-newtoniana, no Einstein: una secuencia de instantáneas no es una fusión ' +
+          'simulada. Con <code>m₂ = 0</code> esto es Schwarzschild isótropo, y el trazador ' +
+          'reproduce √27 M por esa vía.',
+      ),
+      ratio.root,
+      sep.root,
+      ecc.root,
+      evolving.root,
+      speed.root,
+      grid.root,
+      audio.root,
+      row,
+      note(
+        'En este modo no hay disco: lo interesante es el <b>lente doble</b> sobre el fondo ' +
+          'estelar, con dos sombras, imágenes múltiples y anillos de Einstein cruzados. Estos ' +
+          'agujeros no giran ni tienen carga: la solución es conformemente plana, luego ' +
+          '<code>K_ij = 0</code>.',
+      ),
+    )
+    return s.root
+  }
 
   private buildPresets(): HTMLElement {
     const s = section('Presets', true)
@@ -221,6 +518,9 @@ export class ControlPanel {
 
   private buildBlackHole(): HTMLElement {
     const s = section('Agujero negro', true)
+    // En modo binaria, el espin y la carga no aplican: Brill-Lindquist es
+    // conformemente plana. La masa sigue valiendo como escala total.
+    s.root.dataset.hideMode = 'binary'
 
     const mass = slider({
       label: 'Masa',
@@ -357,6 +657,9 @@ export class ControlPanel {
 
   private buildDisk(): HTMLElement {
     const s = section('Disco de acreción', true)
+    // La binaria no tiene disco: es conformemente plana y el interes esta en el
+    // lente doble sobre el fondo.
+    s.root.dataset.hideMode = 'binary mesh'
 
     const enabled = toggle('Disco activo', this.p.diskEnabled, (v) =>
       this.patch({ diskEnabled: v }),
@@ -493,6 +796,59 @@ export class ControlPanel {
     })
     this.sliders.set('milkyWayIntensity', mw)
 
+    // --- Galaxias de fondo -------------------------------------------------
+    const gCount = slider({
+      label: 'Galaxias de fondo',
+      min: 0,
+      max: 4,
+      step: 1,
+      value: this.p.galaxyCount,
+      format: (v) => (v === 0 ? 'ninguna' : `${v.toFixed(0)}`),
+      onInput: (v) => this.patch({ galaxyCount: Math.round(v) }),
+    })
+    this.sliders.set('galaxyCount', gCount)
+
+    const gSize = slider({
+      label: 'Tamaño angular',
+      min: 0.01,
+      max: 0.3,
+      step: 0.005,
+      value: this.p.galaxySize,
+      format: (v) => `${((v * 180) / Math.PI).toFixed(1)}°`,
+      onInput: (v) => this.patch({ galaxySize: v }),
+    })
+    this.sliders.set('galaxySize', gSize)
+
+    const gBright = slider({
+      label: 'Brillo de las galaxias',
+      min: 0,
+      max: 4,
+      step: 0.05,
+      value: this.p.galaxyBrightness,
+      format: (v) => v.toFixed(2),
+      onInput: (v) => this.patch({ galaxyBrightness: v }),
+    })
+    this.sliders.set('galaxyBrightness', gBright)
+
+    const gSpiral = slider({
+      label: 'Brazos espirales',
+      min: 0,
+      max: 2,
+      step: 0.05,
+      value: this.p.galaxySpiral,
+      format: (v) => (v === 0 ? 'elípticas' : v.toFixed(2)),
+      onInput: (v) => this.patch({ galaxySpiral: v }),
+    })
+    this.sliders.set('galaxySpiral', gSpiral)
+
+    const gAlign = toggle('Alinear una detrás del agujero', this.p.galaxyAlignBehind, (v) =>
+      this.patch({ galaxyAlignBehind: v }),
+    )
+    gAlign.root.title =
+      'Coloca la primera galaxia justo detrás del agujero negro respecto a la cámara: es la ' +
+      'configuración que produce un anillo de Einstein completo.'
+    this.toggles.set('galaxyAlignBehind', gAlign)
+
     s.body.append(
       stars.root,
       note(
@@ -504,6 +860,18 @@ export class ControlPanel {
       intensity.root,
       density.root,
       mw.root,
+      note(
+        '<b>Las galaxias van de fondo, no en órbita.</b> Una galaxia tiene ~10¹¹ masas solares y ' +
+          '~30 kpc de diámetro: es mucho más masiva y más grande que cualquier agujero negro, así ' +
+          'que no lo orbita — el agujero está en <em>su</em> centro. Lo que sí es real es su ' +
+          '<b>lente gravitacional</b>: arcos, imágenes múltiples y anillos de Einstein. Es lo que ' +
+          'observan Hubble y JWST, y aquí lo produce el propio trazado, no un efecto dibujado.',
+      ),
+      gCount.root,
+      gSize.root,
+      gBright.root,
+      gSpiral.root,
+      gAlign.root,
     )
     return s.root
   }
@@ -512,6 +880,7 @@ export class ControlPanel {
 
   private buildLayers(): HTMLElement {
     const s = section('Capas geométricas', false)
+    s.root.dataset.onlyMode = 'single'
 
     const defs: Array<[keyof SimParams, string, string]> = [
       ['showHorizon', 'Horizonte de sucesos', 'Rejilla sobre r₊, donde el rayo es capturado'],
@@ -742,9 +1111,34 @@ export class ControlPanel {
     this.diskDir?.set(p.diskPrograde ? 'pro' : 'retro')
     this.orbitDir?.set(p.orbitPrograde ? 'pro' : 'retro')
 
+    this.sliders.get('binaryMassRatio')?.set(p.binaryMassRatio)
+    this.sliders.get('binarySeparation')?.set(p.binarySeparation)
+    this.sliders.get('binaryEccentricity')?.set(p.binaryEccentricity)
+    this.sliders.get('binaryTimeScale')?.set(p.binaryTimeScale)
+    this.sliders.get('meshOuterRadius')?.set(p.meshOuterRadius)
+    this.sliders.get('meshHeightScale')?.set(p.meshHeightScale)
+    this.sliders.get('meshGridDensity')?.set(p.meshGridDensity)
+    this.sliders.get('bodySpeed')?.set(p.bodySpeed)
+    this.sliders.get('galaxyCount')?.set(p.galaxyCount)
+    this.sliders.get('galaxySize')?.set(p.galaxySize)
+    this.sliders.get('galaxyBrightness')?.set(p.galaxyBrightness)
+    this.sliders.get('galaxySpiral')?.set(p.galaxySpiral)
+    this.modeSeg?.set(p.mode)
+    this.bodyClockSeg?.set(p.bodyClock)
+    if (this.bodyKindSel) this.bodyKindSel.value = p.bodyKind
+
     // Mostrar solo el control de distancia del modo activo.
     for (const node of this.root.querySelectorAll<HTMLElement>('[data-mode]')) {
       node.style.display = node.dataset.mode === p.distanceMode ? '' : 'none'
+    }
+    // Secciones que solo aplican a ciertos modos de visualizacion.
+    for (const node of this.root.querySelectorAll<HTMLElement>('[data-only-mode]')) {
+      const modes = (node.dataset.onlyMode ?? '').split(/\s+/)
+      node.style.display = modes.includes(p.mode) ? '' : 'none'
+    }
+    for (const node of this.root.querySelectorAll<HTMLElement>('[data-hide-mode]')) {
+      const modes = (node.dataset.hideMode ?? '').split(/\s+/)
+      node.style.display = modes.includes(p.mode) ? 'none' : ''
     }
     this.syncing = false
   }

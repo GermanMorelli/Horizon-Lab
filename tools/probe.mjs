@@ -8,7 +8,7 @@
 
 import { chromium } from 'playwright'
 
-const url = process.argv[2] ?? 'http://localhost:5199'
+const url = process.argv[2] ?? 'http://localhost:5173'
 
 const browser = await chromium.launch({
   args: ['--use-gl=angle', '--use-angle=swiftshader', '--enable-unsafe-swiftshader'],

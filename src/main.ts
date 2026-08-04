@@ -14,10 +14,21 @@ import {
   periastronPrecession,
   traceOrbit,
 } from './physics/orbits'
+import { blackbodySample } from './physics/blackbody'
+import {
+  BODY_CATALOG,
+  bodyRadiusRg,
+  massRatio,
+  tidalVerdict,
+  TEST_PARTICLE_LIMIT,
+} from './physics/bodies'
+import { findFirstCrossing, pathDuration } from './physics/orbits'
+import { orbitalFrequencyHz } from './physics/waves'
 import { minSafeDistance, OrbitCamera } from './render/OrbitCamera'
 import { traceToPoints } from './render/OrbitOverlay'
 import { Renderer, type RenderStats } from './render/Renderer'
 import { DEFAULT_PARAMS, ParamStore, type SimParams } from './state/params'
+import { ChirpAudio } from './ui/ChirpAudio'
 import { ControlPanel } from './ui/ControlPanel'
 import { Hud } from './ui/Hud'
 import { PRESETS, type Preset } from './ui/Presets'
@@ -106,9 +117,22 @@ renderer.onAutoDowngrade = (scale, frameMs) => {
  * Vigilante de arranque: si pasados unos segundos no se ha completado ni un solo
  * pase de trazado, algo va mal y hay que decirlo en pantalla en vez de dejar el
  * canvas negro sin explicación.
+ *
+ * Se exige que el documento esté visible: en una pestaña en segundo plano el
+ * navegador no ejecuta requestAnimationFrame, así que no haber renderizado es lo
+ * normal y avisar sería una falsa alarma. Un mensaje de error incorrecto es peor
+ * que ninguno, así que en ese caso se reintenta al volver a primer plano.
  */
-window.setTimeout(() => {
+function startupWatchdog(): void {
   if (renderer.hasRendered || renderer.isContextLost) return
+  if (document.visibilityState !== 'visible') {
+    document.addEventListener('visibilitychange', function again() {
+      if (document.visibilityState !== 'visible') return
+      document.removeEventListener('visibilitychange', again)
+      window.setTimeout(startupWatchdog, 10000)
+    })
+    return
+  }
   fatal(
     'No se ha podido dibujar ningún frame',
     'El trazador se inicializó (los shaders compilaron correctamente) pero no ha completado ' +
@@ -117,7 +141,9 @@ window.setTimeout(() => {
       'esté activada en el navegador.',
     `GPU: ${renderer.caps.renderer}\nEXT_color_buffer_float: ${renderer.caps.colorBufferFloat}`,
   )
-}, 10000)
+}
+
+window.setTimeout(startupWatchdog, 10000)
 
 if (renderer.degraded) {
   warnings.flash(
@@ -193,6 +219,51 @@ store.subscribe((p, d) => {
 // Cualquier cambio de estado invalida la imagen acumulada.
 store.subscribe(() => renderer.invalidate())
 
+/**
+ * Reencuadra la cámara al cambiar de modo desde la interfaz.
+ *
+ * Cada modo necesita una cámara distinta, y la del modo anterior suele ser mala:
+ * en la binaria, una inclinación de 90° con azimut 0 coloca la cámara justo sobre
+ * la línea que une los dos agujeros, con uno detrás del otro; y la malla se lee
+ * desde arriba, no de canto.
+ *
+ * Se hace en el callback del botón y NO como suscriptor del store, a propósito: un
+ * suscriptor pisaría la cámara de cualquier patch programático que fije modo y
+ * distancia a la vez (presets, herramientas de verificación), y eso ya causó una
+ * medición con la cámara 16 veces más lejos de lo pedido. Reencuadrar es una
+ * decisión de interacción, no un invariante de estado.
+ */
+function switchMode(mode: SimParams['mode']): void {
+  const p = store.get()
+  if (mode === p.mode) return
+
+  const framing: Partial<SimParams> =
+    mode === 'binary'
+      ? {
+          distanceMode: 'rg',
+          distanceRg: Math.max(2.4 * p.binarySeparation, 60),
+          // Casi desde el eje orbital: así los dos agujeros se ven lado a lado.
+          inclination: (22 * Math.PI) / 180,
+          fov: (45 * Math.PI) / 180,
+        }
+      : mode === 'mesh'
+        ? {
+            distanceMode: 'rg',
+            distanceRg: 45,
+            inclination: (65 * Math.PI) / 180,
+            fov: (45 * Math.PI) / 180,
+          }
+        : {
+            distanceMode: 'rg',
+            distanceRg: DEFAULT_PARAMS.distanceRg,
+            inclination: DEFAULT_PARAMS.inclination,
+            fov: DEFAULT_PARAMS.fov,
+          }
+
+  store.patch({ mode, ...framing })
+  if (mode === 'binary') renderer.resetOrbit(store.get(), store.getDerived())
+}
+
 // ---------------------------------------------------------------------------
 // UI
 // ---------------------------------------------------------------------------
@@ -251,8 +322,22 @@ function launchOrbit(): void {
     })
 
     const color = ORBIT_COLORS[renderer.overlay.list.length % ORBIT_COLORS.length]
+
+    // --- Cuerpo animado sobre la trayectoria -------------------------------
+    const spec = BODY_CATALOG[p.bodyKind] ?? BODY_CATALOG.sun
+    const tidal = tidalVerdict(spec, p.massSolar, d.rPlus, res.rMin)
+    // Color: los planetas no radian, así que se les da su albedo; las estrellas
+    // toman su color de cuerpo negro real desde la misma LUT que el disco.
+    const bodyColor: [number, number, number] =
+      spec.albedo ??
+      (() => {
+        const s = blackbodySample(spec.temperatureK)
+        const m = Math.max(s.chroma[0], s.chroma[1], s.chroma[2], 1e-6)
+        return [s.chroma[0] / m, s.chroma[1] / m, s.chroma[2] / m]
+      })()
+
     renderer.overlay.add({
-      label: `r₀=${r0.toFixed(1)}M`,
+      label: `${spec.label} · r₀=${r0.toFixed(1)}M`,
       color,
       points: traceToPoints(res),
       info: {
@@ -263,7 +348,55 @@ function launchOrbit(): void {
         eps: p.orbitCharge,
         orbits: Math.abs(res.phiTotal) / (2 * Math.PI),
       },
+      body: {
+        result: res,
+        radiusRg: bodyRadiusRg(spec, p.massSolar),
+        tidalRg: tidal.swallowedWhole ? NaN : tidal.rTidal,
+        bodyColor,
+        time: 0,
+        durationProper: pathDuration(res, 'proper'),
+        durationCoordinate: pathDuration(res, 'coordinate'),
+      },
     })
+
+    // --- Avisos de marea y de validez del modelo ---------------------------
+    if (massRatio(spec, p.massSolar) > TEST_PARTICLE_LIMIT) {
+      warnings.flash(
+        'testparticle',
+        'warn',
+        `<b>Fuera del régimen de partícula de prueba</b> — ${spec.label} tiene una masa de ` +
+          `${(massRatio(spec, p.massSolar) * 100).toPrecision(3)} % la del agujero negro. Por ` +
+          'encima del 0.1 % el cuerpo perturba la métrica y tratarlo como geodésica del fondo ' +
+          'fijo deja de ser defendible. Sube la masa del agujero para volver al régimen válido.',
+        16000,
+        '⚠',
+      )
+    }
+    if (tidal.swallowedWhole) {
+      warnings.flash(
+        'tidal',
+        'info',
+        `<b>${spec.label} caería entera</b> — su radio de marea (${tidal.rTidal.toPrecision(3)} M) ` +
+          `queda DENTRO del horizonte (${d.rPlus.toFixed(2)} M). Es lo que pasa en los agujeros ` +
+          'supermasivos: <code>r_t/r_g ∝ M⁻²ᐟ³</code>, así que cuanto más masivo el agujero, más ' +
+          'adentro queda el radio de marea. Por eso no se ven eventos de disrupción en los más grandes.',
+        16000,
+        'ℹ',
+      )
+    } else if (tidal.disrupts) {
+      const cross = findFirstCrossing(res, tidal.rTidal, p.bodyClock)
+      warnings.flash(
+        'tidal',
+        'warn',
+        `<b>${spec.label} se desgarra por marea</b> — cruza su radio de marea de ` +
+          `${tidal.rTidal.toPrecision(3)} M` +
+          (cross ? ` tras ${cross.time.toPrecision(3)} M de tiempo ${p.bodyClock === 'proper' ? 'propio' : 'coordenado'}` : '') +
+          '. El marcador se pone rojo a partir de ahí. La app no simula los restos: modelar la ' +
+          'disrupción exige hidrodinámica, no una geodésica.',
+        16000,
+        '⚠',
+      )
+    }
 
     const outcomeText = {
       captured: 'cae al agujero',
@@ -320,14 +453,71 @@ function circularLocalSpeed(
   return v < 1 ? v : NaN
 }
 
+// --- Chirp audible ---------------------------------------------------------
+
+const chirp = new ChirpAudio()
+
+store.subscribe((p) => {
+  // El audio solo puede arrancar desde un gesto del usuario; el toggle del panel
+  // lo es, así que basta reaccionar al cambio de parámetro.
+  if (p.chirpAudio && p.mode === 'binary' && !chirp.isRunning) {
+    chirp.start().catch((e) => {
+      warnings.flash(
+        'audio',
+        'warn',
+        `<b>No se pudo iniciar el audio</b> — ${e instanceof Error ? e.message : String(e)}`,
+        6000,
+        '⚠',
+      )
+      store.patch({ chirpAudio: false })
+    })
+  } else if ((!p.chirpAudio || p.mode !== 'binary') && chirp.isRunning) {
+    chirp.stop()
+  }
+})
+
 new ControlPanel(panelBody, {
   store,
   onPreset: applyPreset,
+  onModeChange: switchMode,
   onLaunchOrbit: launchOrbit,
+  onResetOrbit: () => {
+    renderer.resetOrbit(store.get(), store.getDerived())
+    renderer.invalidate()
+    warnings.flash('orbit-reset', 'info', '<b>Órbita reiniciada</b>', 3000, '↺')
+  },
+  onGW150914: () => {
+    // Masas del sistema en el marco fuente: 36 + 29 M_sol, a 410 Mpc.
+    store.patch({
+      mode: 'binary',
+      massSolar: 65,
+      binaryMassRatio: 36 / 65,
+      binarySeparation: 60,
+      binaryEccentricity: 0,
+      binaryEvolving: true,
+      distanceMode: 'rg',
+      distanceRg: 70,
+      inclination: (70 * Math.PI) / 180,
+    })
+    renderer.resetOrbit(store.get(), store.getDerived())
+    const d = store.getDerived()
+    warnings.flash(
+      'gw150914',
+      'info',
+      '<b>GW150914</b> — la primera detección directa de ondas gravitacionales (2015): ' +
+        `36 + 29 M☉ a 410 Mpc. Masa de chirp ${d.chirpMassSolar.toFixed(1)} M☉. El modelo de ` +
+        'inspiral corta en ' +
+        `${d.cutoffFrequencyHz.toFixed(0)} Hz; el pico observado fue de ~250 Hz, que ya es la ` +
+        'fusión propiamente dicha y requiere relatividad numérica.',
+      18000,
+      '★',
+    )
+  },
   onClearOrbits: () => {
     renderer.overlay.clear()
     warnings.flash('orbit', 'info', '<b>Órbitas borradas</b>', 3000, '◠')
   },
+  onRewindBodies: () => renderer.overlay.rewind(),
   onResetView: () => {
     store.patch({
       inclination: DEFAULT_PARAMS.inclination,
@@ -391,12 +581,14 @@ function shortRenderer(s: string): string {
   return s.slice(0, 42)
 }
 
-function renderStatsLine(s: RenderStats | null): void {
+function renderStatsLine(s: RenderStats | null, animatingBodies = false): void {
   if (!s) return
   statsSpans.res.innerHTML = `<span class="s-val">${s.internalWidth}×${s.internalHeight}</span> @ ${(s.scale * 100).toFixed(0)}%`
-  statsSpans.spp.innerHTML = s.converged
-    ? `<span class="conv">${s.samples} spp · convergido</span>`
-    : `<span class="s-val">${s.samples}/${s.targetSamples}</span> spp`
+  statsSpans.spp.innerHTML = animatingBodies
+    ? `<span class="s-val">${s.samples} spp</span> · cuerpo en movimiento`
+    : s.converged
+      ? `<span class="conv">${s.samples} spp · convergido</span>`
+      : `<span class="s-val">${s.samples}/${s.targetSamples}</span> spp`
   statsSpans.ms.innerHTML = `<span class="s-val">${s.frameMs.toFixed(1)}</span> ms`
 }
 
@@ -437,6 +629,22 @@ function frame(now: number): void {
   const animating = renderer.advanceTime(dt, p, d)
   if (animating) renderer.invalidate()
 
+  // El chirp se alimenta de la frecuencia orbital VIVA de la binaria, que es la
+  // que va cambiando con el inspiral.
+  if (p.mode === 'binary' && chirp.isRunning) {
+    const o = renderer.binaryOrbit
+    chirp.update(2 * orbitalFrequencyHz(o.a, p.massSolar))
+  }
+
+  // Los cuerpos animados avanzan en el reloj elegido. Mover un cuerpo cambia la
+  // imagen, así que cuenta como animación igual que rotar el disco.
+  let bodiesMoving = false
+  if (p.mode === 'single' && p.showOrbits && p.bodyPlaying) {
+    bodiesMoving = renderer.overlay.advance(dt * p.bodySpeed, p.bodyClock, p.bodyLoop)
+  }
+
+  // El overlay se dibuja después del tonemap, así que mover un cuerpo no obliga a
+  // volver a trazar la imagen: basta con no dejar que se considere convergida.
   const realtime = camera.isInteracting || animating
 
   // Al pasar de tiempo real a reposo hay que rehacer la imagen a resolucion plena.
@@ -447,7 +655,7 @@ function frame(now: number): void {
 
   const stats = renderer.render(p, d, realtime)
   if (stats) lastStats = stats
-  renderStatsLine(stats)
+  renderStatsLine(stats, bodiesMoving)
   requestAnimationFrame(frame)
 }
 

@@ -2,12 +2,9 @@
 // Disco de acrecion delgado: perfil de Novikov-Thorne, cinematica kepleriana,
 // corrimiento total (Doppler + gravitacional) y color de cuerpo negro.
 //
-// Requiere metric.glsl.
+// Requiere metric.glsl y blackbody.glsl (la LUT vive ahi, compartida con el
+// fondo estelar y con el trazador de la binaria).
 // ---------------------------------------------------------------------------
-
-uniform sampler2D u_bbLUT;   // RGB = cromaticidad, A = log10(radiancia visible)
-uniform float u_lutLogTMin;
-uniform float u_lutLogTMax;
 
 uniform float u_diskInner;   // r_in, normalmente el ISCO
 uniform float u_diskOuter;   // r_out
@@ -33,8 +30,6 @@ uniform float u_diskPrograde; // +1 corrotante, -1 contrarrotante
  * agujero negro, que es fisicamente absurdo.
  */
 uniform float u_diskBrightness;
-
-const float LN10 = 2.302585092994046;
 
 // ---------------------------------------------------------------------------
 // Orbitas circulares ecuatoriales
@@ -149,24 +144,6 @@ float diskFbm(float angle, float radial) {
     amp *= 0.5;
   }
   return v;
-}
-
-// ---------------------------------------------------------------------------
-// Color de cuerpo negro desde la LUT
-// ---------------------------------------------------------------------------
-
-/**
- * Emision visible de un cuerpo negro a temperatura T (kelvin), en RGB lineal.
- * La LUT guarda la cromaticidad con luminancia unidad y, en el canal alfa, el
- * log10 de la radiancia visible relativa: en logaritmo la interpolacion lineal
- * de la textura es fiel a lo largo de las ~20 decadas que cubre el rango.
- */
-vec3 blackbodyEmission(float T) {
-  if (T <= 0.0) return vec3(0.0);
-  float logT = log(T) / LN10;
-  float idx = (logT - u_lutLogTMin) / (u_lutLogTMax - u_lutLogTMin);
-  vec4 s = texture(u_bbLUT, vec2(clamp(idx, 0.001, 0.999), 0.5));
-  return s.rgb * pow(10.0, s.a);
 }
 
 // ---------------------------------------------------------------------------

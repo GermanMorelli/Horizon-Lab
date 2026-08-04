@@ -20,6 +20,14 @@ import {
   type BHParams,
 } from '../physics/kerrNewman'
 import { shadowAngularRadius, shadowMetrics } from '../physics/shadowRim'
+import { isotropicHorizonRadius, properSeparation } from '../physics/binary'
+import { chirpMass } from '../physics/pn'
+import { mergerFrequency, orbitalFrequencyHz, timeToMerger } from '../physics/waves'
+import {
+  equatorialEmbedding,
+  horizonEmbedding,
+  properRadialDistance,
+} from '../physics/embedding'
 import {
   diskMaxTemperature,
   gravitationalRadius,
@@ -32,7 +40,51 @@ export const SPIN_LIMIT = 0.998
 
 export type DistanceMode = 'rg' | 'physical'
 
+/**
+ * Modo de visualizacion.
+ *  - 'single': un agujero de Kerr-Newman (masa, carga y espin), trazado exacto.
+ *  - 'binary': dos agujeros sobre datos iniciales de Brill-Lindquist. Exacto en
+ *    las ligaduras de Einstein, NO en la evolucion; las orbitas las da la
+ *    dinamica post-newtoniana.
+ *  - 'mesh': geometria de la rebanada espacial (embedding de Flamm) y campo de
+ *    dilatacion temporal.
+ */
+export type ViewMode = 'single' | 'binary' | 'mesh'
+
 export interface SimParams {
+  /** Modo de visualizacion. */
+  mode: ViewMode
+
+  // --- Binaria -------------------------------------------------------------
+  /** Fraccion de masa del primer agujero, m1/(m1+m2), en (0, 1). */
+  binaryMassRatio: number
+  /** Semieje mayor inicial, en unidades de la masa total. */
+  binarySeparation: number
+  /** Excentricidad orbital inicial. */
+  binaryEccentricity: number
+  /** Si la orbita evoluciona por reaccion de radiacion. */
+  binaryEvolving: boolean
+  /** Factor de aceleracion del inspiral respecto al tiempo real. */
+  binaryTimeScale: number
+  /** Dibuja una rejilla sobre cada horizonte para distinguir las dos sombras. */
+  binaryShowGrid: boolean
+  /** Reproduce el chirp por audio. */
+  chirpAudio: boolean
+
+  // --- Malla del espaciotiempo --------------------------------------------
+  /** Muestra la superficie del embedding isometrico (paraboloide de Flamm). */
+  meshShowSurface: boolean
+  /** Colorea la superficie por el lapso (dilatacion temporal). */
+  meshShowLapse: boolean
+  /** Radio exterior de la malla, en unidades de M. */
+  meshOuterRadius: number
+  /** Exageracion vertical del embedding (1 = isometrico exacto). */
+  meshHeightScale: number
+  /** Densidad de la rejilla. */
+  meshGridDensity: number
+  /** Muestra tambien la superficie del horizonte (limite de Smarr). */
+  meshShowHorizon: boolean
+
   // --- Agujero negro -------------------------------------------------------
   /** Masa en masas solares. */
   massSolar: number
@@ -73,6 +125,38 @@ export interface SimParams {
   starIntensity: number
   starDensity: number
   milkyWayIntensity: number
+
+  // --- Galaxias de fondo ---------------------------------------------------
+  /**
+   * Numero de galaxias de fondo (0-4).
+   *
+   * Van de FONDO y no en orbita: una galaxia es mucho mas masiva y mas grande que
+   * cualquier agujero negro, asi que no lo orbita. Lo que si es real es su lente
+   * gravitacional, que es lo que se traza.
+   */
+  galaxyCount: number
+  galaxyBrightness: number
+  /** Radio angular de las galaxias, en radianes. */
+  galaxySize: number
+  /** Intensidad de los brazos espirales; 0 = elipticas lisas. */
+  galaxySpiral: number
+  /**
+   * Coloca una galaxia exactamente detras del agujero negro respecto a la camara,
+   * que es la configuracion que produce un anillo de Einstein completo.
+   */
+  galaxyAlignBehind: boolean
+
+  // --- Cuerpos de prueba animados ------------------------------------------
+  /** Clave del catalogo de cuerpos (`BODY_CATALOG`). */
+  bodyKind: string
+  /** Con que reloj se anima: el del cuerpo o el del observador lejano. */
+  bodyClock: 'proper' | 'coordinate'
+  /** Animacion en marcha. */
+  bodyPlaying: boolean
+  /** Velocidad de la animacion, en unidades de M por segundo real. */
+  bodySpeed: number
+  /** Reiniciar el recorrido al terminar. */
+  bodyLoop: boolean
 
   // --- Capas geometricas ---------------------------------------------------
   showHorizon: boolean
@@ -128,6 +212,23 @@ export interface SimParams {
 }
 
 export const DEFAULT_PARAMS: SimParams = {
+  mode: 'single',
+
+  binaryMassRatio: 0.55,
+  binarySeparation: 40,
+  binaryEccentricity: 0,
+  binaryEvolving: false,
+  binaryTimeScale: 1,
+  binaryShowGrid: true,
+  chirpAudio: false,
+
+  meshShowSurface: true,
+  meshShowLapse: true,
+  meshOuterRadius: 18,
+  meshHeightScale: 1,
+  meshGridDensity: 1,
+  meshShowHorizon: false,
+
   massSolar: 6.5e9,
   spin: 0.9,
   charge: 0,
@@ -159,6 +260,18 @@ export const DEFAULT_PARAMS: SimParams = {
   starIntensity: 1,
   starDensity: 0.5,
   milkyWayIntensity: 0.35,
+
+  galaxyCount: 0,
+  galaxyBrightness: 1,
+  galaxySize: 0.06,
+  galaxySpiral: 1,
+  galaxyAlignBehind: true,
+
+  bodyKind: 'sun',
+  bodyClock: 'proper',
+  bodyPlaying: true,
+  bodySpeed: 40,
+  bodyLoop: true,
 
   showHorizon: false,
   showErgosphere: false,
@@ -235,6 +348,34 @@ export interface Derived {
   iscoPeriodSeconds: number
   /** Radio de captura de rayos usado por el shader. */
   rCapture: number
+
+  // --- Binaria -------------------------------------------------------------
+  /** Masas de puntura, en unidades de la masa ADM total (suman 1). */
+  binaryM1: number
+  binaryM2: number
+  /** Masa de chirp, en unidades de la masa total. */
+  chirpMassGeom: number
+  /** Masa de chirp en masas solares. */
+  chirpMassSolar: number
+  /** Frecuencia de la onda gravitacional en Hz. */
+  gwFrequencyHz: number
+  /** Tiempo hasta la fusion, en segundos. */
+  mergerTimeSeconds: number
+  /** Frecuencia gravitacional a la que corta el modelo de inspiral. */
+  cutoffFrequencyHz: number
+  /** Separacion propia entre los horizontes, en unidades de M. */
+  binaryProperSeparation: number
+  /** Radios isotropos de los dos horizontes. */
+  binaryR1: number
+  binaryR2: number
+
+  // --- Malla ---------------------------------------------------------------
+  /** Profundidad de la garganta del embedding, en unidades de M. */
+  meshDepth: number
+  /** true si el horizonte no admite inmersion euclidea (a/M > sqrt(3)/2). */
+  horizonEmbeddingFails: boolean
+  /** Distancia propia desde el horizonte hasta r = 10 M. */
+  properDistanceToTen: number
 }
 
 export function computeDerived(p: SimParams): Derived {
@@ -257,6 +398,26 @@ export function computeDerived(p: SimParams): Derived {
 
   const diskTempMaxK = diskMaxTemperature(p.massSolar, p.eddingtonRatio)
   const tgSeconds = gravitationalTime(p.massSolar)
+
+  // --- Binaria -------------------------------------------------------------
+  // Las masas de puntura se normalizan a masa ADM total 1, que para
+  // Brill-Lindquist es exactamente m1 + m2.
+  const bm1 = Math.min(Math.max(p.binaryMassRatio, 0.02), 0.98)
+  const bm2 = 1 - bm1
+  const mcGeom = chirpMass({ m1: bm1, m2: bm2 })
+  const mcSolar = mcGeom * p.massSolar
+  const fGw = orbitalFrequencyHz(p.binarySeparation, p.massSolar) * 2
+  const fCut = mergerFrequency(bm1 * p.massSolar, bm2 * p.massSolar)
+  const tMerge =
+    fGw > 0 && fGw < fCut ? timeToMerger(fGw, bm1 * p.massSolar, bm2 * p.massSolar) : 0
+  const punctures = [
+    { m: bm1, pos: [-bm2 * p.binarySeparation, 0, 0] as [number, number, number] },
+    { m: bm2, pos: [bm1 * p.binarySeparation, 0, 0] as [number, number, number] },
+  ]
+
+  // --- Malla ---------------------------------------------------------------
+  const emb = equatorialEmbedding(bh, p.meshOuterRadius, 240)
+  const horizonEmb = horizonEmbedding(bh, 400)
 
   // Periodo orbital en el ISCO: T = 2 pi / Omega en unidades de M, x GM/c^3.
   const omegaIsco = 1 / (Math.pow(rDiskInner, 1.5) + (prograde ? bh.a : -bh.a))
@@ -290,6 +451,23 @@ export function computeDerived(p: SimParams): Derived {
     diskTempMaxK,
     iscoPeriodSeconds,
     rCapture: captureRadius(bh),
+
+    binaryM1: bm1,
+    binaryM2: bm2,
+    chirpMassGeom: mcGeom,
+    chirpMassSolar: mcSolar,
+    gwFrequencyHz: fGw,
+    mergerTimeSeconds: tMerge,
+    cutoffFrequencyHz: fCut,
+    binaryProperSeparation: properSeparation(punctures, 800),
+    binaryR1: isotropicHorizonRadius(bm1),
+    binaryR2: isotropicHorizonRadius(bm2),
+
+    meshDepth: emb.depth,
+    horizonEmbeddingFails: horizonEmb.fails,
+    properDistanceToTen: h.hasHorizon
+      ? properRadialDistance(h.rPlus * (1 + 1e-6), 10, bh, 2000)
+      : NaN,
   }
 }
 

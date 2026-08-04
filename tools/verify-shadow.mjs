@@ -19,8 +19,28 @@
 
 import { chromium } from 'playwright'
 
-const baseUrl = process.argv[2] ?? 'http://localhost:5199'
+const baseUrl = process.argv[2] ?? 'http://localhost:5173'
 const url = `${baseUrl}${baseUrl.includes('?') ? '&' : '?'}capture=1`
+
+/**
+ * Si la pagina se recarga a mitad de una medicion, Playwright lanza
+ * "Execution context was destroyed" con una traza que no dice nada util. La causa
+ * casi siempre es el HMR de Vite recargando tras editar un archivo de src/
+ * mientras la verificacion corria.
+ */
+process.on('uncaughtException', (e) => {
+  const msg = String(e?.message ?? e)
+  if (/Execution context was destroyed|Target (page|closed)|Target closed/.test(msg)) {
+    console.error(
+      '\n✗ La página se recargó a mitad de la medición.\n' +
+        '  Causa habitual: el HMR de Vite recargó la página porque se editó un archivo de\n' +
+        '  src/ mientras corría la verificación. Vuelve a ejecutarla sin tocar el código.',
+    )
+    process.exit(2)
+  }
+  console.error(e)
+  process.exit(1)
+})
 
 const browser = await chromium.launch({
   args: ['--use-gl=angle', '--use-angle=swiftshader', '--enable-unsafe-swiftshader'],
@@ -59,6 +79,12 @@ async function measure(patch, label) {
         timeWarp: 0,
         exposure: 3,
         autoExposure: true,
+        // La calidad adaptativa DEBE estar desactivada: baja la resolucion interna
+        // segun la velocidad de la GPU, y la medicion del borde de la sombra
+        // depende de la resolucion. Con ella activa la medida deja de ser
+        // reproducible (se observo un desplazamiento del 3 % bajo SwiftShader).
+        autoQuality: false,
+        mode: 'single',
         renderScale: 1,
         targetSamples: 10,
         // Presupuesto amplio: un rayo sin converger recibe el fondo atenuado en

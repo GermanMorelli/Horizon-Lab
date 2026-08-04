@@ -22,7 +22,13 @@
  * sombra.
  */
 
-import { toCartesian, type OrbitResult } from '../physics/orbits'
+import {
+  sampleAt,
+  toCartesian,
+  type Clock,
+  type OrbitResult,
+  type Snapshot,
+} from '../physics/orbits'
 import { horizons, type BHParams } from '../physics/kerrNewman'
 import { Program } from './gl'
 
@@ -43,6 +49,27 @@ export interface OrbitTrace {
     charged: boolean
     eps: number
     orbits: number
+  }
+  /**
+   * Cuerpo animado sobre esta trayectoria, si lo hay.
+   *
+   * El resultado completo del trazado se conserva para poder muestrear la posicion
+   * en cualquier instante de cualquiera de los dos relojes, en lugar de recalcular
+   * la orbita en cada frame.
+   */
+  body?: {
+    result: OrbitResult
+    /** Radio del marcador en unidades de M (el radio fisico del cuerpo). */
+    radiusRg: number
+    /** Radio de marea en unidades de M; NaN si no aplica. */
+    tidalRg: number
+    /** Color del cuerpo en RGB lineal. */
+    bodyColor: [number, number, number]
+    /** Tiempo transcurrido en el reloj activo. */
+    time: number
+    /** Duracion total en cada reloj. */
+    durationProper: number
+    durationCoordinate: number
   }
 }
 
@@ -101,10 +128,54 @@ export class OrbitOverlay {
   }
 
   /**
+   * Avanza el reloj de todos los cuerpos animados.
+   * @param dt incremento en el reloj elegido, en unidades geometricas de M
+   * @param loop si al terminar el recorrido se reinicia
+   * @returns true si algun cuerpo se movio
+   */
+  advance(dt: number, clock: Clock, loop: boolean): boolean {
+    let moved = false
+    for (const t of this.traces) {
+      if (!t.body) continue
+      const total = clock === 'proper' ? t.body.durationProper : t.body.durationCoordinate
+      if (total <= 0) continue
+      t.body.time += dt
+      if (t.body.time >= total) t.body.time = loop ? t.body.time % total : total
+      moved = true
+    }
+    return moved
+  }
+
+  /** Reinicia el reloj de todos los cuerpos. */
+  rewind(): void {
+    for (const t of this.traces) if (t.body) t.body.time = 0
+  }
+
+  /** Estado actual de los cuerpos animados, para el HUD. */
+  bodyStates(clock: Clock): Array<{
+    trace: OrbitTrace
+    snap: Snapshot
+    disrupted: boolean
+  }> {
+    const out: Array<{ trace: OrbitTrace; snap: Snapshot; disrupted: boolean }> = []
+    for (const t of this.traces) {
+      if (!t.body) continue
+      const snap = sampleAt(t.body.result, t.body.time, clock)
+      if (!snap) continue
+      out.push({
+        trace: t,
+        snap,
+        disrupted: Number.isFinite(t.body.tidalRg) && snap.r <= t.body.tidalRg,
+      })
+    }
+    return out
+  }
+
+  /**
    * Dibuja las orbitas sobre el framebuffer actual.
    * Debe llamarse DESPUES del composite, ya que compone en espacio de pantalla.
    */
-  draw(cam: OverlayCamera, bh: BHParams, opacity: number): void {
+  draw(cam: OverlayCamera, bh: BHParams, opacity: number, clock: Clock = 'proper'): void {
     if (this.traces.length === 0 || opacity <= 0) return
     const gl = this.gl
 
@@ -195,8 +266,109 @@ export class OrbitOverlay {
       gl.drawArrays(gl.LINE_STRIP, 0, written)
     }
 
+    // --- Marcadores de los cuerpos animados --------------------------------
+    for (const trace of this.traces) {
+      if (!trace.body) continue
+      const snap = sampleAt(trace.body.result, trace.body.time, clock)
+      if (!snap) continue
+      this.drawBodyMarker(trace, snap, C, rHat, thHat, phHat, cam, rBlock)
+    }
+
     gl.disable(gl.BLEND)
     gl.bindVertexArray(null)
+  }
+
+  /**
+   * Marcador del cuerpo: una circunferencia en la posicion interpolada, de radio
+   * igual al tamano angular real del cuerpo (con un minimo en pixeles para que siga
+   * siendo visible cuando es diminuto, que es el caso habitual).
+   *
+   * Se dibuja con la misma proyeccion recta que las lineas, asi que hereda la misma
+   * limitacion declarada: es un diagrama superpuesto, no luz trazada.
+   */
+  private drawBodyMarker(
+    trace: OrbitTrace,
+    snap: Snapshot,
+    C: [number, number, number],
+    rHat: [number, number, number],
+    thHat: [number, number, number],
+    phHat: [number, number, number],
+    cam: OverlayCamera,
+    rBlock: number,
+  ): void {
+    const gl = this.gl
+    const body = trace.body!
+    const P = snap.cart
+
+    const dx = P[0] - C[0]
+    const dy = P[1] - C[1]
+    const dz = P[2] - C[2]
+    const aR = dx * rHat[0] + dy * rHat[1] + dz * rHat[2]
+    const aT = dx * thHat[0] + dy * thHat[1] + dz * thHat[2]
+    const aP = dx * phHat[0] + dy * phHat[1] + dz * phHat[2]
+    const s = -aR
+    if (s <= 1e-6) return
+
+    const cxNdc = aP / (s * cam.tanHalfFov * cam.aspect)
+    const cyNdc = -aT / (s * cam.tanHalfFov)
+
+    // Ocultacion por el agujero, igual que las lineas.
+    let fade = 1
+    if (rBlock > 0) {
+      const len2 = dx * dx + dy * dy + dz * dz
+      if (len2 > 1e-12) {
+        const u = -(C[0] * dx + C[1] * dy + C[2] * dz) / len2
+        if (u > 0 && u < 1) {
+          const qx = C[0] + u * dx
+          const qy = C[1] + u * dy
+          const qz = C[2] + u * dz
+          const dist = Math.sqrt(qx * qx + qy * qy + qz * qz)
+          fade = Math.min(1, Math.max(0, (dist - rBlock) / (0.6 * rBlock)))
+        }
+      }
+    }
+    if (fade <= 0.01) return
+
+    // Radio angular del cuerpo -> radio en NDC. Se impone un minimo para que un
+    // planeta (que a escala del agujero es un punto) siga siendo visible.
+    const dist3 = Math.sqrt(dx * dx + dy * dy + dz * dz)
+    const angRad = Math.atan(body.radiusRg / Math.max(dist3, 1e-6))
+    const rNdc = Math.max(angRad / cam.tanHalfFov, 0.012)
+
+    // Rojo si esta dentro del radio de marea: se esta desgarrando.
+    const disrupted = Number.isFinite(body.tidalRg) && snap.r <= body.tidalRg
+    const col = disrupted ? ([1.0, 0.28, 0.2] as [number, number, number]) : body.bodyColor
+
+    // Circunferencia como tira de lineas cerrada, mas una cruz central para que se
+    // localice bien cuando el circulo es minimo.
+    const N = 28
+    const need = (N + 1 + 5) * 3
+    if (this.scratch.length < need) this.scratch = new Float32Array(need)
+    const buf = this.scratch
+    let n = 0
+    for (let i = 0; i <= N; i++) {
+      const a = (2 * Math.PI * i) / N
+      buf[n * 3] = cxNdc + rNdc * Math.cos(a) * (1 / cam.aspect)
+      buf[n * 3 + 1] = cyNdc + rNdc * Math.sin(a)
+      buf[n * 3 + 2] = fade
+      n++
+    }
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.vbo)
+    gl.bufferData(gl.ARRAY_BUFFER, buf.subarray(0, n * 3), gl.DYNAMIC_DRAW)
+    this.prog.v3('u_color', col[0], col[1], col[2])
+    gl.drawArrays(gl.LINE_STRIP, 0, n)
+
+    // Cruz central.
+    const k = rNdc * 0.55
+    const cross: number[] = [
+      cxNdc - k / cam.aspect, cyNdc, fade,
+      cxNdc + k / cam.aspect, cyNdc, fade,
+      cxNdc, cyNdc - k, fade,
+      cxNdc, cyNdc + k, fade,
+    ]
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(cross), gl.DYNAMIC_DRAW)
+    gl.drawArrays(gl.LINES, 0, 4)
   }
 
   dispose(): void {

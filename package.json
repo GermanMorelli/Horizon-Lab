@@ -10,7 +10,21 @@
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "verify:ui": "node tools/verify-ui.mjs",
+    "verify:shadow": "node tools/verify-shadow.mjs",
+    "verify:doppler": "node tools/verify-doppler.mjs",
+    "verify:binary": "node tools/verify-binary.mjs",
+    "verify:mesh": "node tools/verify-mesh.mjs",
+    "verify:bodies": "node tools/verify-bodies.mjs",
+    "verify:smoke": "node tools/smoke.mjs",
+    "verify:gpu": "npm run verify:ui && npm run verify:smoke && npm run verify:shadow && npm run verify:doppler && npm run verify:binary && npm run verify:mesh && npm run verify:bodies",
+    "verify": "npm run typecheck && npm run test && npm run verify:gpu",
+    "ascii": "vite-node tools/ascii-art.ts",
+    "diag": "node tools/diag.mjs",
+    "probe:accum": "node tools/probe.mjs",
+    "probe:orbit": "vite-node tools/probe-orbit.ts",
+    "probe:isco": "vite-node tools/probe-isco.ts"
   },
   "devDependencies": {
     "@types/node": "^26.1.2",

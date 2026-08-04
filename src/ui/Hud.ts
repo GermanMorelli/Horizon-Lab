@@ -6,6 +6,8 @@
  */
 
 import { visibleFraction, wienPeakWavelength } from '../physics/blackbody'
+import { staticLapse } from '../physics/embedding'
+import { ChirpAudio } from './ChirpAudio'
 import { formatLength, formatTime, radToMicroArcsec } from '../physics/units'
 import type { Derived, ParamStore, SimParams } from '../state/params'
 import { hudGroup, hudRow, num, sci } from './widgets'
@@ -82,12 +84,49 @@ export class Hud {
     this.add(scale, 'tg', 't_g', 'tiempo gravitacional', 'GM/c³')
     this.add(scale, 'thawking', 'T_H', 'temperatura de Hawking')
 
-    this.root.append(geom, orb, shadow, cam, disk, scale)
+    const bin = hudGroup('Binaria')
+    bin.dataset.onlyMode = 'binary'
+    this.add(bin, 'binM', 'm₁/m₂', 'masas de puntura', 'En unidades de la masa ADM total, que para Brill-Lindquist es m₁+m₂')
+    this.add(bin, 'binSep', 'a', 'separación coordenada')
+    this.add(bin, 'binProper', 'ℓ', 'separación propia', 'Distancia propia entre horizontes: mayor que la coordenada')
+    this.add(bin, 'binHor', 'r₊', 'horizontes isótropos', 'Cada uno en r = m/2')
+    this.add(bin, 'binMc', 'M_c', 'masa de chirp', '(m₁m₂)^(3/5)/M^(1/5): el parámetro que fija el inspiral')
+    this.add(bin, 'binF', 'f_gw', 'frecuencia de la onda')
+    this.add(bin, 'binFCut', 'f_corte', 'corte del modelo', 'El inspiral post-newtoniano deja de valer en a = 6M')
+    this.add(bin, 'binMerge', 't_c', 'tiempo a la fusión')
+    this.add(bin, 'binChirp', '♪', 'chirp audible')
+
+    const mesh = hudGroup('Malla')
+    mesh.dataset.onlyMode = 'mesh'
+    this.add(mesh, 'meshDepth', 'z', 'profundidad de la garganta')
+    this.add(
+      mesh,
+      'meshProper',
+      'ℓ',
+      'distancia propia r₊→10M',
+      'Comparar con la diferencia de coordenadas: la malla se estira de verdad',
+    )
+    this.add(mesh, 'meshCoord', 'Δr', 'diferencia coordenada')
+    this.add(
+      mesh,
+      'meshHorEmb',
+      '—',
+      'horizonte sumergible',
+      'Con a/M > √3/2 ≈ 0.866 el horizonte no cabe en espacio euclídeo (Smarr 1973)',
+    )
+    this.add(mesh, 'meshLapseH', 'α', 'lapso en r = 3M', 'Ritmo del tiempo propio frente al coordenado')
+
+    this.root.append(geom, orb, shadow, cam, disk, bin, mesh, scale)
   }
 
   private update(p: SimParams, d: Derived): void {
     const set = (k: string, v: string, dim = false) => this.rows.get(k)?.set(v, dim)
     const noHorizon = !d.hasHorizon
+
+    // Grupos que solo aplican a ciertos modos de visualizacion.
+    for (const node of this.root.querySelectorAll<HTMLElement>('[data-only-mode]')) {
+      node.style.display = (node.dataset.onlyMode ?? '').split(/\s+/).includes(p.mode) ? '' : 'none'
+    }
 
     // --- Geometría ---------------------------------------------------------
     set('extremality', num(d.extremality, 4), false)
@@ -143,6 +182,42 @@ export class Hud {
     } else {
       for (const k of ['tmax', 'wien', 'visfrac', 'rin']) set(k, 'disco apagado', true)
     }
+
+    // --- Binaria -----------------------------------------------------------
+    set('binM', `${d.binaryM1.toFixed(3)} / ${d.binaryM2.toFixed(3)}`)
+    set('binSep', `${p.binarySeparation.toFixed(1)} M`)
+    set('binProper', `${d.binaryProperSeparation.toFixed(1)} M`)
+    set('binHor', `${d.binaryR1.toFixed(3)} / ${d.binaryR2.toFixed(3)} M`)
+    set('binMc', `${d.chirpMassGeom.toFixed(4)} M · ${sci(d.chirpMassSolar)} M☉`)
+    set('binF', `${sci(d.gwFrequencyHz)} Hz`)
+    set('binFCut', `${sci(d.cutoffFrequencyHz)} Hz`)
+    set(
+      'binMerge',
+      d.mergerTimeSeconds > 0 ? formatTime(d.mergerTimeSeconds) : 'ya en fusión',
+      d.mergerTimeSeconds <= 0,
+    )
+    const audible = ChirpAudio.toAudible(d.gwFrequencyHz)
+    set(
+      'binChirp',
+      p.chirpAudio
+        ? audible.octaveShift === 0
+          ? `${audible.playedHz.toFixed(1)} Hz (real)`
+          : `${audible.playedHz.toFixed(1)} Hz (${audible.octaveShift > 0 ? '+' : ''}${audible.octaveShift} oct)`
+        : 'apagado',
+      !p.chirpAudio,
+    )
+
+    // --- Malla -------------------------------------------------------------
+    set('meshDepth', `${num(d.meshDepth, 2)} M`)
+    set('meshProper', Number.isFinite(d.properDistanceToTen) ? `${num(d.properDistanceToTen, 2)} M` : '—')
+    set('meshCoord', d.hasHorizon ? `${num(10 - d.rPlus, 2)} M` : '—', true)
+    set(
+      'meshHorEmb',
+      d.hasHorizon ? (d.horizonEmbeddingFails ? 'NO (a/M > √3/2)' : 'sí') : '—',
+    )
+    const hEmb = this.rows.get('meshHorEmb')
+    if (hEmb) hEmb.root.style.color = d.horizonEmbeddingFails ? 'var(--warn)' : ''
+    set('meshLapseH', num(staticLapse(3, d.bh), 4))
 
     // --- Escalas físicas ---------------------------------------------------
     set('rg', formatLength(d.rgMeters))

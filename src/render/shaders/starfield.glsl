@@ -26,6 +26,84 @@ uniform bool u_useStarCube;
  */
 const float STAR_CALIBRATION = 0.09;
 const float MW_CALIBRATION = 0.03;
+const float GALAXY_CALIBRATION = 0.5;
+
+// ---------------------------------------------------------------------------
+// Galaxias de fondo
+//
+// Una galaxia NO orbita un agujero negro: tiene ~10^11 masas solares y ~30 kpc de
+// diametro, asi que es el objeto grande y el agujero el pequeno. Lo que si es real,
+// y es lo que se hace aqui, es el LENTE GRAVITACIONAL de galaxias de fondo: sus
+// arcos, sus anillos de Einstein y sus imagenes multiples son astronomia
+// observacional corriente (Hubble, JWST).
+//
+// Aqui no se dibuja ningun arco: se define el perfil de brillo de la galaxia en el
+// cielo asintotico, y la deformacion la produce el propio trazado de geodesicas al
+// muestrear ese perfil con la direccion de escape del rayo.
+// ---------------------------------------------------------------------------
+
+#define MAX_GALAXIES 4
+
+uniform int u_galaxyCount;
+/** Direccion unitaria de cada galaxia en el cielo asintotico. */
+uniform vec3 u_galaxyDir[MAX_GALAXIES];
+/** (radio angular, razon de ejes, angulo de posicion, brillo). */
+uniform vec4 u_galaxyShape[MAX_GALAXIES];
+/** Color en RGB lineal. */
+uniform vec3 u_galaxyColor[MAX_GALAXIES];
+/** Intensidad de los brazos espirales, 0 = eliptica lisa. */
+uniform float u_galaxySpiral;
+
+/**
+ * Brillo superficial de las galaxias de fondo en la direccion `dir`.
+ *
+ * Perfil: disco exponencial (Sersic n = 1) mas una componente central mas
+ * concentrada, con una modulacion espiral logaritmica opcional. La proyeccion al
+ * plano tangente es gnomonica, valida mientras la galaxia sea pequena en el cielo,
+ * que es siempre el caso.
+ */
+vec3 galaxyLight(vec3 dir) {
+  vec3 sum = vec3(0.0);
+  for (int i = 0; i < MAX_GALAXIES; i++) {
+    if (i >= u_galaxyCount) break;
+
+    vec3 g = u_galaxyDir[i];
+    float cosA = dot(dir, g);
+    // Detras del observador o a mas de 90 grados: no contribuye.
+    if (cosA <= 0.05) continue;
+
+    // Base ortonormal en el plano tangente a la esfera celeste en g.
+    vec3 helper = abs(g.z) < 0.9 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+    vec3 t1 = normalize(cross(helper, g));
+    vec3 t2 = cross(g, t1);
+
+    // Proyeccion gnomonica del desplazamiento angular.
+    vec3 off = dir / cosA - g;
+    float u = dot(off, t1);
+    float v = dot(off, t2);
+
+    // Rotacion por el angulo de posicion y achatamiento por la razon de ejes:
+    // asi la galaxia se ve inclinada, no siempre de frente.
+    float pa = u_galaxyShape[i].z;
+    float cu = cos(pa) * u + sin(pa) * v;
+    float cv = (-sin(pa) * u + cos(pa) * v) / max(u_galaxyShape[i].y, 0.05);
+
+    float scale = max(u_galaxyShape[i].x, 1e-5);
+    float rad = length(vec2(cu, cv)) / scale;
+    if (rad > 6.0) continue;
+
+    // Disco exponencial + componente central.
+    float disc = exp(-1.68 * rad);
+    float core = 0.45 * exp(-3.5 * sqrt(rad));
+
+    // Brazos espirales logaritmicos: dos brazos, con la fase creciendo como log(r).
+    float ang = atan(cv, cu);
+    float arms = 1.0 + u_galaxySpiral * 0.5 * sin(2.0 * ang + 5.0 * log(max(rad, 0.06)));
+
+    sum += u_galaxyColor[i] * u_galaxyShape[i].w * (disc * arms + core);
+  }
+  return sum * GALAXY_CALIBRATION;
+}
 
 vec3 hash33(vec3 p) {
   p = fract(p * vec3(0.1031, 0.1030, 0.0973));
@@ -145,5 +223,6 @@ vec3 background(vec3 dir) {
   c += starLayer(dir, 760.0, u_starDensity * 0.35, 0.10);
   c *= u_starIntensity * STAR_CALIBRATION;
   c += milkyWay(dir) * u_milkyWayIntensity * MW_CALIBRATION;
+  c += galaxyLight(dir);
   return c;
 }

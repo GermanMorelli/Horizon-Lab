@@ -1,0 +1,17 @@
+# Dependencias
+node_modules/
+
+# Cachés de herramientas
+.vite/
+*.tsbuildinfo
+
+# Salidas de las herramientas de verificación (se regeneran con npm run verify:gpu)
+tools/out/
+
+# Sistema y editores
+.DS_Store
+Thumbs.db
+*.log
+.idea/
+.vscode/*
+!.vscode/extensions.json
